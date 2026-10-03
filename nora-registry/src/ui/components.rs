@@ -1,0 +1,1261 @@
+// Copyright (c) 2026 The NORA Authors
+// SPDX-License-Identifier: MIT
+
+use super::i18n::{get_translations, Lang, Translations};
+
+/// Application version from Cargo.toml
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Enabled-registry set for the sidebar nav — immutable process config, set once
+/// at startup via [`set_enabled_registries`]. The sole reader is [`layout_dark`],
+/// which hands it to the sidebar filter so the nav lists exactly the enabled
+/// registries (matching the dashboard body, which filters by the same set).
+/// Threading `Option<&HashSet<RegistryType>>` through the ~30 page-render call
+/// sites would be the type-honest alternative; this global is `accepted` because
+/// the set is immutable config (cf. the metrics registry) — the upgrade path is
+/// that explicit threading. `None` until set (unit tests), where the sidebar
+/// falls back to showing every supported format.
+static ENABLED_REGISTRIES: std::sync::OnceLock<
+    std::collections::HashSet<crate::registry_type::RegistryType>,
+> = std::sync::OnceLock::new();
+
+/// Record the enabled-registry set for the sidebar. Call once at startup; later
+/// calls are ignored (the set is immutable config).
+pub fn set_enabled_registries(set: std::collections::HashSet<crate::registry_type::RegistryType>) {
+    let _ = ENABLED_REGISTRIES.set(set);
+}
+
+/// Dark theme layout wrapper for dashboard
+pub fn layout_dark(
+    title: &str,
+    content: &str,
+    active_page: Option<&str>,
+    extra_scripts: &str,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    layout_dark_filtered(
+        title,
+        content,
+        active_page,
+        extra_scripts,
+        lang,
+        auth_enabled,
+        ENABLED_REGISTRIES.get(),
+    )
+}
+
+/// Dark theme layout wrapper with optional registry filter
+pub fn layout_dark_filtered(
+    title: &str,
+    content: &str,
+    active_page: Option<&str>,
+    extra_scripts: &str,
+    lang: Lang,
+    auth_enabled: bool,
+    enabled_registries: Option<&std::collections::HashSet<crate::registry_type::RegistryType>>,
+) -> String {
+    let t = get_translations(lang);
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="{}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{} - Nora</title>
+    <link rel="stylesheet" href="/ui/static/tailwind.css">
+    <script src="/ui/static/htmx.min.js"></script>
+    <style>
+        [x-cloak] {{ display: none !important; }}
+        .sidebar-open {{ overflow: hidden; }}
+    </style>
+</head>
+<body class="bg-[#0f172a] min-h-screen">
+    <div class="flex h-screen overflow-hidden">
+        <!-- Mobile sidebar overlay -->
+        <div id="sidebar-overlay" class="fixed inset-0 bg-black/50 z-40 hidden md:hidden" onclick="toggleSidebar()"></div>
+
+        <!-- Sidebar -->
+        {}
+
+        <!-- Main content -->
+        <div class="flex-1 flex flex-col overflow-hidden min-w-0">
+            <!-- Header -->
+            {}
+
+            <!-- Content -->
+            <main class="flex-1 overflow-y-auto p-4 md:p-6">
+                {}
+            </main>
+        </div>
+    </div>
+
+    <script>
+        function toggleSidebar() {{
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebar-overlay');
+            const isOpen = !sidebar.classList.contains('-translate-x-full');
+
+            if (isOpen) {{
+                sidebar.classList.add('-translate-x-full');
+                overlay.classList.add('hidden');
+                document.body.classList.remove('sidebar-open');
+            }} else {{
+                sidebar.classList.remove('-translate-x-full');
+                overlay.classList.remove('hidden');
+                document.body.classList.add('sidebar-open');
+            }}
+        }}
+
+        function setLang(lang) {{
+            document.cookie = 'nora_lang=' + lang + ';path=/;max-age=31536000';
+            window.location.reload();
+        }}
+    </script>
+    {}
+</body>
+</html>"##,
+        lang.code(),
+        html_escape(title),
+        sidebar_dark_with_registries(active_page, t, auth_enabled, enabled_registries),
+        header_dark(lang),
+        content,
+        extra_scripts
+    )
+}
+
+/// Dark theme sidebar with optional registry filter
+pub fn sidebar_dark_with_registries(
+    active_page: Option<&str>,
+    t: &Translations,
+    auth_enabled: bool,
+    enabled: Option<&std::collections::HashSet<crate::registry_type::RegistryType>>,
+) -> String {
+    let active = active_page.unwrap_or("");
+
+    let docker_icon = r#"<path fill="currentColor" d="M13.983 11.078h2.119a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.119a.185.185 0 00-.185.185v1.888c0 .102.083.185.185.185m-2.954-5.43h2.118a.186.186 0 00.186-.186V3.574a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.186m0 2.716h2.118a.187.187 0 00.186-.186V6.29a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.887c0 .102.082.185.185.186m-2.93 0h2.12a.186.186 0 00.184-.186V6.29a.185.185 0 00-.185-.185H8.1a.185.185 0 00-.185.185v1.887c0 .102.083.185.185.186m-2.964 0h2.119a.186.186 0 00.185-.186V6.29a.185.185 0 00-.185-.185H5.136a.186.186 0 00-.186.185v1.887c0 .102.084.185.186.186m5.893 2.715h2.118a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m-2.93 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.083.185.185.185m-2.964 0h2.119a.185.185 0 00.185-.185V9.006a.185.185 0 00-.185-.186h-2.12a.186.186 0 00-.185.186v1.887c0 .102.084.185.186.185m-2.92 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.082.185.185.185M23.763 9.89c-.065-.051-.672-.51-1.954-.51-.338.001-.676.03-1.01.087-.248-1.7-1.653-2.53-1.716-2.566l-.344-.199-.226.327c-.284.438-.49.922-.612 1.43-.23.97-.09 1.882.403 2.661-.595.332-1.55.413-1.744.42H.751a.751.751 0 00-.75.748 11.376 11.376 0 00.692 4.062c.545 1.428 1.355 2.48 2.41 3.124 1.18.723 3.1 1.137 5.275 1.137.983.003 1.963-.086 2.93-.266a12.248 12.248 0 003.823-1.389c.98-.567 1.86-1.288 2.61-2.136 1.252-1.418 1.998-2.997 2.553-4.4h.221c1.372 0 2.215-.549 2.68-1.009.309-.293.55-.65.707-1.046l.098-.288Z"/>"#;
+    let maven_icon = r#"<path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>"#;
+    let npm_icon = r#"<path fill="currentColor" d="M0 7.334v8h6.666v1.332H12v-1.332h12v-8H0zm6.666 6.664H5.334v-4H3.999v4H1.335V8.667h5.331v5.331zm4 0v1.336H8.001V8.667h5.334v5.332h-2.669v-.001zm12.001 0h-1.33v-4h-1.336v4h-1.335v-4h-1.33v4h-2.671V8.667h8.002v5.331zM10.665 10H12v2.667h-1.335V10z"/>"#;
+    let cargo_icon = r#"<path fill="currentColor" d="M6 2h12a1 1 0 011 1v8a1 1 0 01-1 1H6a1 1 0 01-1-1V3a1 1 0 011-1zm0 2v2h12V4H6zm0 3v2h12V7H6zM2 14h8a1 1 0 011 1v6a1 1 0 01-1 1H2a1 1 0 01-1-1v-6a1 1 0 011-1zm0 2v1.5h8V16H2zM14 14h8a1 1 0 011 1v6a1 1 0 01-1 1h-8a1 1 0 01-1-1v-6a1 1 0 011-1zm0 2v1.5h8V16h-8z"/>"#;
+    let pypi_icon = r#"<path fill="currentColor" d="M14.25.18l.9.2.73.26.59.3.45.32.34.34.25.34.16.33.1.3.04.26.02.2-.01.13V8.5l-.05.63-.13.55-.21.46-.26.38-.3.31-.33.25-.35.19-.35.14-.33.1-.3.07-.26.04-.21.02H8.83l-.69.05-.59.14-.5.22-.41.27-.33.32-.27.35-.2.36-.15.37-.1.35-.07.32-.04.27-.02.21v3.06H3.23l-.21-.03-.28-.07-.32-.12-.35-.18-.36-.26-.36-.36-.35-.46-.32-.59-.28-.73-.21-.88-.14-1.05L0 11.97l.06-1.22.16-1.04.24-.87.32-.71.36-.57.4-.44.42-.33.42-.24.4-.16.36-.1.32-.05.24-.01h.16l.06.01h8.16v-.83H6.24l-.01-2.75-.02-.37.05-.34.11-.31.17-.28.25-.26.31-.23.38-.2.44-.18.51-.15.58-.12.64-.1.71-.06.77-.04.84-.02 1.27.05 1.07.13zm-6.3 1.98l-.23.33-.08.41.08.41.23.34.33.22.41.09.41-.09.33-.22.23-.34.08-.41-.08-.41-.23-.33-.33-.22-.41-.09-.41.09-.33.22zM21.1 6.11l.28.06.32.12.35.18.36.27.36.35.35.47.32.59.28.73.21.88.14 1.04.05 1.23-.06 1.23-.16 1.04-.24.86-.32.71-.36.57-.4.45-.42.33-.42.24-.4.16-.36.09-.32.05-.24.02-.16-.01h-8.22v.82h5.84l.01 2.76.02.36-.05.34-.11.31-.17.29-.25.25-.31.24-.38.2-.44.17-.51.15-.58.13-.64.09-.71.07-.77.04-.84.01-1.27-.04-1.07-.14-.9-.2-.73-.25-.59-.3-.45-.33-.34-.34-.25-.34-.16-.33-.1-.3-.04-.25-.02-.2.01-.13v-5.34l.05-.64.13-.54.21-.46.26-.38.3-.32.33-.24.35-.2.35-.14.33-.1.3-.06.26-.04.21-.02.13-.01h5.84l.69-.05.59-.14.5-.21.41-.28.33-.32.27-.35.2-.36.15-.36.1-.35.07-.32.04-.28.02-.21V6.07h2.09l.14.01.21.03zm-6.47 14.25l-.23.33-.08.41.08.41.23.33.33.23.41.08.41-.08.33-.23.23-.33.08-.41-.08-.41-.23-.33-.33-.23-.41-.08-.41.08-.33.23z"/>"#;
+
+    // Dashboard label is translated, registry names stay as-is
+    let dashboard_label = t.nav_dashboard;
+
+    use crate::registry_type::RegistryType;
+
+    // All possible nav items with their RegistryType
+    let all_nav_items: Vec<(Option<RegistryType>, &str, &str, &str, &str, bool)> = vec![
+        (
+            None,
+            "dashboard",
+            "/ui/",
+            dashboard_label,
+            r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>"#,
+            true,
+        ),
+        (
+            Some(RegistryType::Docker),
+            "docker",
+            "/ui/docker",
+            "Docker",
+            docker_icon,
+            false,
+        ),
+        (
+            Some(RegistryType::Maven),
+            "maven",
+            "/ui/maven",
+            "Maven",
+            maven_icon,
+            false,
+        ),
+        (
+            Some(RegistryType::Npm),
+            "npm",
+            "/ui/npm",
+            "npm",
+            npm_icon,
+            false,
+        ),
+        (
+            Some(RegistryType::Cargo),
+            "cargo",
+            "/ui/cargo",
+            "Cargo",
+            cargo_icon,
+            false,
+        ),
+        (
+            Some(RegistryType::PyPI),
+            "pypi",
+            "/ui/pypi",
+            "PyPI",
+            pypi_icon,
+            false,
+        ),
+        (
+            Some(RegistryType::Raw),
+            "raw",
+            "/ui/raw",
+            "Raw",
+            r#"<path fill="currentColor" d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zm4 18H6V4h7v5h5v11z"/>"#,
+            false,
+        ),
+        (
+            Some(RegistryType::Go),
+            "go",
+            "/ui/go",
+            "Go",
+            r#"<path fill="currentColor" d="M2.64 9.56s.24-.14.65-.38c.41-.24.97-.5 1.63-.7A7.85 7.85 0 017.53 8c.86 0 1.67.17 2.37.52.7.35 1.26.87 1.63 1.51.37.64.54 1.41.54 2.27v.2h-2.7v-.16c0-.47-.09-.86-.28-1.15a1.7 1.7 0 00-.77-.67 2.7 2.7 0 00-1.14-.22c-.56 0-1.06.13-1.46.4-.41.27-.72.66-.93 1.16-.21.5-.31 1.1-.31 1.8 0 .69.1 1.28.32 1.78.21.5.53.88.94 1.15.41.27.9.4 1.47.4.38 0 .73-.06 1.04-.17.31-.12.56-.29.74-.52.19-.23.29-.51.29-.84v-.14H7.15v-1.76h5.07v1.3c0 .8-.17 1.48-.52 2.04a3.46 3.46 0 01-1.5 1.3c-.66.3-1.44.45-2.35.45-.99 0-1.87-.18-2.63-.55a4.2 4.2 0 01-1.77-1.59C3.15 14.82 3 13.94 3 12.89v-.28c0-1.04.16-1.93.48-2.65a3.08 3.08 0 01-.84-.4zm12.1-1.34c.92 0 1.74.18 2.44.55a3.96 3.96 0 011.66 1.59c.4.7.6 1.54.6 2.53v.28c0 .99-.2 1.83-.6 2.53a3.96 3.96 0 01-1.66 1.59c-.7.37-1.52.55-2.44.55s-1.74-.18-2.44-.55a3.96 3.96 0 01-1.66-1.59c-.4-.7-.6-1.54-.6-2.53v-.28c0-.99.2-1.83.6-2.53a3.96 3.96 0 011.66-1.59c.7-.37 1.52-.55 2.44-.55zm0 2.12c-.44 0-.82.12-1.14.37-.32.24-.56.6-.73 1.06-.17.46-.26 1.01-.26 1.65v.28c0 .64.09 1.19.26 1.65.17.46.41.82.73 1.06.32.25.7.37 1.14.37.44 0 .82-.12 1.14-.37.32-.24.56-.6.73-1.06.17-.46.26-1.01.26-1.65v-.28c0-.64-.09-1.19-.26-1.65a2.17 2.17 0 00-.73-1.06 1.78 1.78 0 00-1.14-.37z"/>"#,
+            false,
+        ),
+        (
+            Some(RegistryType::Gems),
+            "gems",
+            "/ui/gems",
+            "RubyGems",
+            icons::GEMS,
+            false,
+        ),
+        (
+            Some(RegistryType::Terraform),
+            "terraform",
+            "/ui/terraform",
+            "Terraform",
+            icons::TERRAFORM,
+            false,
+        ),
+        (
+            Some(RegistryType::Ansible),
+            "ansible",
+            "/ui/ansible",
+            "Ansible",
+            icons::ANSIBLE,
+            false,
+        ),
+        (
+            Some(RegistryType::Nuget),
+            "nuget",
+            "/ui/nuget",
+            "NuGet",
+            icons::NUGET,
+            false,
+        ),
+        (
+            Some(RegistryType::PubDart),
+            "pub",
+            "/ui/pub",
+            "pub.dev",
+            icons::PUB,
+            true,
+        ),
+        (
+            Some(RegistryType::Conan),
+            "conan",
+            "/ui/conan",
+            "Conan",
+            icons::CONAN,
+            false,
+        ),
+        (
+            Some(RegistryType::Rpm),
+            "rpm",
+            "/ui/rpm",
+            "RPM",
+            icons::RPM,
+            false,
+        ),
+        (
+            Some(RegistryType::Deb),
+            "deb",
+            "/ui/deb",
+            "Debian",
+            icons::DEB,
+            false,
+        ),
+        (
+            Some(RegistryType::Cpan),
+            "cpan",
+            "/ui/cpan",
+            "CPAN",
+            icons::CPAN,
+            false,
+        ),
+    ];
+
+    // Filter to enabled registries (dashboard always shown)
+    let nav_items: Vec<_> = all_nav_items
+        .into_iter()
+        .filter(|(reg_type, _, _, _, _, _)| {
+            match reg_type {
+                None => true, // Dashboard always visible
+                Some(rt) => match enabled {
+                    Some(set) => set.contains(rt),
+                    None => true, // No filter = show all
+                },
+            }
+        })
+        .map(|(_, id, href, label, icon, is_stroke)| (id, href, label, icon, is_stroke))
+        .collect();
+
+    let render_nav_item = |id: &str,
+                           href: &str,
+                           label: &str,
+                           icon_path: &str,
+                           is_stroke: bool|
+     -> String {
+        let is_active = active == id;
+        let active_class = if is_active {
+            "bg-slate-700 text-white"
+        } else {
+            "text-slate-300 hover:bg-slate-700 hover:text-white"
+        };
+
+        let (fill_attr, stroke_attr) = if is_stroke {
+            ("none", r#" stroke="currentColor""#)
+        } else {
+            ("currentColor", "")
+        };
+
+        format!(
+            r##"
+            <a href="{}" class="flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors {}">
+                <svg class="w-5 h-5 mr-3" fill="{}"{} viewBox="0 0 24 24">
+                    {}
+                </svg>
+                {}
+            </a>
+        "##,
+            href, active_class, fill_attr, stroke_attr, icon_path, label
+        )
+    };
+
+    let dashboard_html: String = nav_items
+        .iter()
+        .filter(|(id, _, _, _, _)| *id == "dashboard")
+        .map(|(id, href, label, icon, is_stroke)| {
+            render_nav_item(id, href, label, icon, *is_stroke)
+        })
+        .collect();
+
+    let registries_html: String = nav_items
+        .iter()
+        .filter(|(id, _, _, _, _)| *id != "dashboard")
+        .map(|(id, href, label, icon, is_stroke)| {
+            render_nav_item(id, href, label, icon, *is_stroke)
+        })
+        .collect();
+
+    // Suppress the whole registries section (header + items) when nothing is
+    // enabled — otherwise an empty "REGISTRIES" header would sit alone (#704).
+    let registries_section = if registries_html.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r##"<div class="border-t border-slate-700 mt-4 pt-4">
+                    <div class="text-xs font-semibold text-slate-400 uppercase tracking-wider px-4 mb-3">
+                        {}
+                    </div>
+                    {}
+                </div>"##,
+            t.nav_registries, registries_html
+        )
+    };
+
+    // Flat sidebar items (no umbrella category)
+    let admin_section = if auth_enabled {
+        let tokens_active = if active == "tokens" {
+            "bg-slate-700 text-white"
+        } else {
+            "text-slate-300 hover:bg-slate-700 hover:text-white"
+        };
+        format!(
+            r##"
+                <div class="border-t border-slate-700 mt-6 pt-4">
+                    <a href="/ui/tokens" class="flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors {}">
+                        <svg class="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
+                        </svg>
+                        {}
+                    </a>
+                </div>
+            "##,
+            tokens_active, t.nav_tokens
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"
+        <div id="sidebar" class="fixed md:static inset-y-0 left-0 z-50 w-64 bg-slate-800 text-white flex flex-col transform -translate-x-full md:translate-x-0 transition-transform duration-200 ease-in-out">
+            <div class="h-16 flex items-center justify-between px-6 border-b border-slate-700">
+                <div class="flex items-center">
+                    <span class="text-xl font-bold tracking-tight">N<span class="inline-block w-4 h-4 rounded-full border-2 border-current align-middle mx-px"></span>RA</span>
+                </div>
+                <button onclick="toggleSidebar()" class="md:hidden p-1 rounded-lg hover:bg-slate-700">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+            <nav class="flex-1 px-4 py-6 space-y-1 overflow-y-auto">
+                {}
+                {}
+                {}
+            </nav>
+            <div class="px-4 py-4 border-t border-slate-700">
+                <div class="text-xs text-slate-400">
+                    Nora v{}
+                </div>
+            </div>
+        </div>
+    "#,
+        dashboard_html, registries_section, admin_section, VERSION
+    )
+}
+
+/// Dark theme header with language switcher
+fn header_dark(lang: Lang) -> String {
+    let (en_class, ru_class, zh_class) = match lang {
+        Lang::En => (
+            "text-white font-semibold",
+            "text-slate-400 hover:text-slate-200",
+            "text-slate-400 hover:text-slate-200",
+        ),
+        Lang::Ru => (
+            "text-slate-400 hover:text-slate-200",
+            "text-white font-semibold",
+            "text-slate-400 hover:text-slate-200",
+        ),
+        Lang::Zh => (
+            "text-slate-400 hover:text-slate-200",
+            "text-slate-400 hover:text-slate-200",
+            "text-white font-semibold",
+        ),
+    };
+
+    format!(
+        r##"
+        <header class="h-16 bg-[#1e293b] border-b border-slate-700 flex items-center justify-between px-4 md:px-6">
+            <div class="flex items-center">
+                <button onclick="toggleSidebar()" class="md:hidden p-2 -ml-2 mr-2 rounded-lg hover:bg-slate-700">
+                    <svg class="w-6 h-6 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
+                    </svg>
+                </button>
+                <div class="md:hidden flex items-center">
+                    <span class="font-bold text-slate-200 tracking-tight">N<span class="inline-block w-4 h-4 rounded-full border-2 border-current align-middle mx-px"></span>RA</span>
+                </div>
+            </div>
+            <div class="flex items-center space-x-2 md:space-x-4">
+                <!-- Language switcher -->
+                <div class="flex items-center border border-slate-600 rounded-lg overflow-hidden text-sm">
+                    <button onclick="setLang('en')" class="px-3 py-1.5 {} transition-colors">EN</button>
+                    <span class="text-slate-600">|</span>
+                    <button onclick="setLang('ru')" class="px-3 py-1.5 {} transition-colors">RU</button>
+                    <span class="text-slate-600">|</span>
+                    <button onclick="setLang('zh')" class="px-3 py-1.5 {} transition-colors">中文</button>
+                </div>
+                <a href="https://github.com/getnora-io/nora" target="_blank" class="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded-lg">
+                    <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                        <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"/>
+                    </svg>
+                </a>
+                <a href="/api-docs" class="p-2 text-slate-400 hover:text-slate-200 hover:bg-slate-700 rounded-lg" title="API Docs">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                    </svg>
+                </a>
+            </div>
+        </header>
+    "##,
+        en_class, ru_class, zh_class
+    )
+}
+
+/// Render global stats row (5-column grid)
+pub fn render_global_stats(
+    downloads: u64,
+    uploads: u64,
+    artifacts: u64,
+    cache_hit_percent: f64,
+    storage_bytes: u64,
+    lang: Lang,
+) -> String {
+    let t = get_translations(lang);
+    // Downloads / uploads / cache-hit derive from Prometheus counters, which reset
+    // on process restart (#626). Rather than clutter the labels, each such card
+    // carries a hover tooltip (`title`) + a small ⓘ marker; current-state cards
+    // (artifacts, storage) have neither.
+    format!(
+        r##"
+        <div class="grid grid-cols-3 md:grid-cols-3 lg:grid-cols-5 gap-2 md:gap-4 mb-6">
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 cursor-help" title="{}">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-downloads" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
+            </div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 cursor-help" title="{}">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-uploads" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
+            </div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-artifacts" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
+            </div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700 cursor-help" title="{}">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-cache-hit" class="text-base md:text-2xl font-bold text-slate-200">{:.1}%</div>
+            </div>
+            <div class="bg-[#1e293b] rounded-lg p-2 md:p-4 border border-slate-700">
+                <div class="text-slate-400 text-xs md:text-sm mb-0.5 md:mb-1 truncate">{}</div>
+                <div id="stat-storage" class="text-base md:text-2xl font-bold text-slate-200">{}</div>
+            </div>
+        </div>
+        "##,
+        t.stats_since_restart,
+        t.stat_downloads,
+        downloads,
+        t.stats_since_restart,
+        t.stat_uploads,
+        uploads,
+        t.stat_artifacts,
+        artifacts,
+        t.stats_since_restart,
+        t.stat_cache_hit,
+        cache_hit_percent,
+        t.stat_storage,
+        format_size(storage_bytes)
+    )
+}
+
+/// Render registry card with extended metrics
+#[allow(clippy::too_many_arguments)]
+pub fn render_registry_card(
+    name: &str,
+    icon_path: &str,
+    artifact_count: usize,
+    downloads: u64,
+    uploads: u64,
+    size_bytes: u64,
+    href: &str,
+    t: &Translations,
+) -> String {
+    format!(
+        r##"
+        <a href="{}" id="registry-{}" class="block bg-[#1e293b] rounded-lg border border-slate-700 p-2 md:p-3 hover:border-blue-400 transition-all">
+            <div class="flex items-center justify-between mb-1 md:mb-2">
+                <svg class="w-5 h-5 md:w-6 md:h-6 text-slate-400" fill="currentColor" viewBox="0 0 24 24">
+                    {}
+                </svg>
+                <span class="text-[10px] font-medium text-green-400 bg-green-400/10 px-1.5 py-0.5 rounded-full">{}</span>
+            </div>
+            <div class="text-xs md:text-sm font-semibold text-slate-200 mb-1 md:mb-2 leading-tight">{}</div>
+            <div class="grid grid-cols-2 gap-1 text-xs">
+                <div>
+                    <span class="text-slate-500">{}</span>
+                    <div class="text-slate-300 font-medium">{}</div>
+                </div>
+                <div>
+                    <span class="text-slate-500">{}</span>
+                    <div class="text-slate-300 font-medium">{}</div>
+                </div>
+                <div>
+                    <span class="text-slate-500">{}</span>
+                    <div class="text-slate-300 font-medium">{}</div>
+                </div>
+                <div>
+                    <span class="text-slate-500">{}</span>
+                    <div class="text-slate-300 font-medium">{}</div>
+                </div>
+            </div>
+        </a>
+        "##,
+        href,
+        name.to_lowercase(),
+        icon_path,
+        t.active,
+        name,
+        t.artifacts,
+        artifact_count,
+        t.size,
+        format_size(size_bytes),
+        t.downloads,
+        downloads,
+        t.uploads,
+        uploads
+    )
+}
+
+/// Render mount points table
+pub fn render_mount_points_table(
+    mount_points: &[(String, String, Vec<String>)],
+    t: &Translations,
+) -> String {
+    let rows: String = mount_points
+        .iter()
+        .map(|(registry, mount_path, upstreams)| {
+            let proxy_display = if upstreams.is_empty() {
+                "-".to_string()
+            } else {
+                upstreams
+                    .iter()
+                    .map(|u| html_escape(u))
+                    .collect::<Vec<_>>()
+                    .join("<br>")
+            };
+            format!(
+                r##"
+                <tr class="border-b border-slate-700">
+                    <td class="px-4 py-3 text-slate-300">{}</td>
+                    <td class="px-4 py-3 font-mono text-blue-400">{}</td>
+                    <td class="px-4 py-3 text-slate-400">{}</td>
+                </tr>
+                "##,
+                html_escape(registry),
+                html_escape(mount_path),
+                proxy_display
+            )
+        })
+        .collect();
+
+    format!(
+        r##"
+        <div class="bg-[#1e293b] rounded-lg border border-slate-700 overflow-hidden">
+            <div class="px-4 py-3 border-b border-slate-700">
+                <h3 class="text-slate-200 font-semibold">{}</h3>
+            </div>
+            <div class="overflow-auto max-h-80">
+                <table class="w-full">
+                    <thead class="sticky top-0 bg-slate-800">
+                        <tr class="text-left text-xs text-slate-500 uppercase border-b border-slate-700">
+                            <th class="px-4 py-2">{}</th>
+                            <th class="px-4 py-2">{}</th>
+                            <th class="px-4 py-2">{}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        "##,
+        t.mount_points, t.registry, t.mount_path, t.proxy_upstream, rows
+    )
+}
+
+/// Render a single activity log row
+pub fn render_activity_row(
+    timestamp: &str,
+    action: &str,
+    artifact: &str,
+    registry: &str,
+    source: &str,
+) -> String {
+    let action_color = match action {
+        "PULL" => "text-blue-400",
+        "PUSH" => "text-green-400",
+        "CACHE" => "text-yellow-400",
+        "PROXY" => "text-purple-400",
+        _ => "text-slate-400",
+    };
+
+    format!(
+        r##"
+        <tr class="border-b border-slate-700/50 text-sm">
+            <td class="px-4 py-2 text-slate-500">{}</td>
+            <td class="px-4 py-2 font-medium {}"><span class="px-2 py-0.5 bg-slate-700 rounded">{}</span></td>
+            <td class="px-4 py-2 text-slate-300 font-mono text-xs">{}</td>
+            <td class="px-4 py-2 text-slate-400">{}</td>
+            <td class="px-4 py-2 text-slate-500">{}</td>
+        </tr>
+        "##,
+        html_escape(timestamp),
+        action_color,
+        html_escape(action),
+        html_escape(artifact),
+        html_escape(registry),
+        html_escape(source)
+    )
+}
+
+/// Render the activity log container
+pub fn render_activity_log(rows: &str, t: &Translations) -> String {
+    format!(
+        r##"
+        <div class="bg-[#1e293b] rounded-lg border border-slate-700 overflow-hidden">
+            <div class="px-4 py-3 border-b border-slate-700 flex items-center justify-between">
+                <h3 class="text-slate-200 font-semibold">{}</h3>
+                <span class="text-xs text-slate-500">{}</span>
+            </div>
+            <div class="overflow-auto max-h-80">
+                <table class="w-full" id="activity-log">
+                    <thead class="sticky top-0 bg-slate-800">
+                        <tr class="text-left text-xs text-slate-500 uppercase border-b border-slate-700">
+                            <th class="px-4 py-2">{}</th>
+                            <th class="px-4 py-2">{}</th>
+                            <th class="px-4 py-2">{}</th>
+                            <th class="px-4 py-2">{}</th>
+                            <th class="px-4 py-2">{}</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        "##,
+        t.recent_activity,
+        t.last_n_events,
+        t.time,
+        t.action,
+        t.artifact,
+        t.registry,
+        t.source,
+        rows
+    )
+}
+
+/// Render the polling script for auto-refresh
+pub fn render_polling_script() -> String {
+    r##"
+    <script>
+        setInterval(async () => {
+            try {
+                const data = await fetch('/api/ui/dashboard').then(r => r.json());
+
+                // Update global stats
+                document.getElementById('stat-downloads').textContent = data.global_stats.downloads;
+                document.getElementById('stat-uploads').textContent = data.global_stats.uploads;
+                document.getElementById('stat-artifacts').textContent = data.global_stats.artifacts;
+                document.getElementById('stat-cache-hit').textContent = data.global_stats.cache_hit_percent.toFixed(1) + '%';
+
+                // Format storage size
+                const bytes = data.global_stats.storage_bytes;
+                let sizeStr;
+                if (bytes >= 1073741824) sizeStr = (bytes / 1073741824).toFixed(1) + ' GB';
+                else if (bytes >= 1048576) sizeStr = (bytes / 1048576).toFixed(1) + ' MB';
+                else if (bytes >= 1024) sizeStr = (bytes / 1024).toFixed(1) + ' KB';
+                else sizeStr = bytes + ' B';
+                document.getElementById('stat-storage').textContent = sizeStr;
+
+                // Update uptime
+                const uptime = document.getElementById('uptime');
+                if (uptime) {
+                    const secs = data.uptime_seconds;
+                    const hours = Math.floor(secs / 3600);
+                    const mins = Math.floor((secs % 3600) / 60);
+                    uptime.textContent = hours + 'h ' + mins + 'm';
+                }
+            } catch (e) {
+                console.error('Dashboard poll failed:', e);
+            }
+        }, 5000);
+    </script>
+    "##.to_string()
+}
+
+/// SVG icon definitions for registries (exported for use in templates)
+pub mod icons {
+    pub const DOCKER: &str = r#"<path fill="currentColor" d="M13.983 11.078h2.119a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.119a.185.185 0 00-.185.185v1.888c0 .102.083.185.185.185m-2.954-5.43h2.118a.186.186 0 00.186-.186V3.574a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.186m0 2.716h2.118a.187.187 0 00.186-.186V6.29a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.887c0 .102.082.185.185.186m-2.93 0h2.12a.186.186 0 00.184-.186V6.29a.185.185 0 00-.185-.185H8.1a.185.185 0 00-.185.185v1.887c0 .102.083.185.185.186m-2.964 0h2.119a.186.186 0 00.185-.186V6.29a.185.185 0 00-.185-.185H5.136a.186.186 0 00-.186.185v1.887c0 .102.084.185.186.186m5.893 2.715h2.118a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m-2.93 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.083.185.185.185m-2.964 0h2.119a.185.185 0 00.185-.185V9.006a.185.185 0 00-.185-.186h-2.12a.186.186 0 00-.185.186v1.887c0 .102.084.185.186.185m-2.92 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.082.185.185.185M23.763 9.89c-.065-.051-.672-.51-1.954-.51-.338.001-.676.03-1.01.087-.248-1.7-1.653-2.53-1.716-2.566l-.344-.199-.226.327c-.284.438-.49.922-.612 1.43-.23.97-.09 1.882.403 2.661-.595.332-1.55.413-1.744.42H.751a.751.751 0 00-.75.748 11.376 11.376 0 00.692 4.062c.545 1.428 1.355 2.48 2.41 3.124 1.18.723 3.1 1.137 5.275 1.137.983.003 1.963-.086 2.93-.266a12.248 12.248 0 003.823-1.389c.98-.567 1.86-1.288 2.61-2.136 1.252-1.418 1.998-2.997 2.553-4.4h.221c1.372 0 2.215-.549 2.68-1.009.309-.293.55-.65.707-1.046l.098-.288Z"/>"#;
+    pub const MAVEN: &str = r#"<path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/>"#;
+    pub const NPM: &str = r#"<path fill="currentColor" d="M0 7.334v8h6.666v1.332H12v-1.332h12v-8H0zm6.666 6.664H5.334v-4H3.999v4H1.335V8.667h5.331v5.331zm4 0v1.336H8.001V8.667h5.334v5.332h-2.669v-.001zm12.001 0h-1.33v-4h-1.336v4h-1.335v-4h-1.33v4h-2.671V8.667h8.002v5.331zM10.665 10H12v2.667h-1.335V10z"/>"#;
+    pub const CARGO: &str = r#"<path fill="currentColor" d="M6 2h12a1 1 0 011 1v8a1 1 0 01-1 1H6a1 1 0 01-1-1V3a1 1 0 011-1zm0 2v2h12V4H6zm0 3v2h12V7H6zM2 14h8a1 1 0 011 1v6a1 1 0 01-1 1H2a1 1 0 01-1-1v-6a1 1 0 011-1zm0 2v1.5h8V16H2zM14 14h8a1 1 0 011 1v6a1 1 0 01-1 1h-8a1 1 0 01-1-1v-6a1 1 0 011-1zm0 2v1.5h8V16h-8z"/>"#;
+    pub const GO: &str = r#"<path fill="currentColor" d="M2.64 9.56s.24-.14.65-.38c.41-.24.97-.5 1.63-.7A7.85 7.85 0 017.53 8c.86 0 1.67.17 2.37.52.7.35 1.26.87 1.63 1.51.37.64.54 1.41.54 2.27v.2h-2.7v-.16c0-.47-.09-.86-.28-1.15a1.7 1.7 0 00-.77-.67 2.7 2.7 0 00-1.14-.22c-.56 0-1.06.13-1.46.4-.41.27-.72.66-.93 1.16-.21.5-.31 1.1-.31 1.8 0 .69.1 1.28.32 1.78.21.5.53.88.94 1.15.41.27.9.4 1.47.4.38 0 .73-.06 1.04-.17.31-.12.56-.29.74-.52.19-.23.29-.51.29-.84v-.14H7.15v-1.76h5.07v1.3c0 .8-.17 1.48-.52 2.04a3.46 3.46 0 01-1.5 1.3c-.66.3-1.44.45-2.35.45-.99 0-1.87-.18-2.63-.55a4.2 4.2 0 01-1.77-1.59C3.15 14.82 3 13.94 3 12.89v-.28c0-1.04.16-1.93.48-2.65a3.08 3.08 0 01-.84-.4zm12.1-1.34c.92 0 1.74.18 2.44.55a3.96 3.96 0 011.66 1.59c.4.7.6 1.54.6 2.53v.28c0 .99-.2 1.83-.6 2.53a3.96 3.96 0 01-1.66 1.59c-.7.37-1.52.55-2.44.55s-1.74-.18-2.44-.55a3.96 3.96 0 01-1.66-1.59c-.4-.7-.6-1.54-.6-2.53v-.28c0-.99.2-1.83.6-2.53a3.96 3.96 0 011.66-1.59c.7-.37 1.52-.55 2.44-.55zm0 2.12c-.44 0-.82.12-1.14.37-.32.24-.56.6-.73 1.06-.17.46-.26 1.01-.26 1.65v.28c0 .64.09 1.19.26 1.65.17.46.41.82.73 1.06.32.25.7.37 1.14.37.44 0 .82-.12 1.14-.37.32-.24.56-.6.73-1.06.17-.46.26-1.01.26-1.65v-.28c0-.64-.09-1.19-.26-1.65a2.17 2.17 0 00-.73-1.06 1.78 1.78 0 00-1.14-.37z"/>"#;
+    pub const DEB: &str = r#"<path fill="currentColor" d="M13.88 12.685c-.4 0 .08.2.601.28.14-.1.27-.22.39-.33a3.001 3.001 0 01-.99.05m2.14-.53c.23-.33.4-.69.47-1.06-.06.27-.2.5-.33.73-.75.47-.07-.27 0-.56-.8 1.01-.11.6-.14.89m.781-2.05c.05-.721-.14-.501-.2-.221.07.04.13.5.2.22M12.38.31c.2.04.45.07.42.12.23-.05.28-.1-.43-.12m.43.12l-.15.03.14-.01V.43m6.633 9.944c.02.64-.2.95-.38 1.5l-.35.181c-.28.54.03.35-.17.78-.44.39-1.34 1.22-1.62 1.301-.201 0 .14-.25.19-.34-.591.4-.481.6-1.371.85l-.03-.06c-2.221 1.04-5.303-1.02-5.253-3.842-.03.17-.07.13-.12.2a3.551 3.552 0 012.001-3.501 3.361 3.362 0 013.732.48 3.341 3.342 0 00-2.721-1.3c-1.18.01-2.281.76-2.651 1.57-.6.38-.67 1.47-.93 1.661-.361 2.601.66 3.722 2.38 5.042.27.19.08.21.12.35a4.702 4.702 0 01-1.53-1.16c.23.33.47.66.8.91-.55-.18-1.27-1.3-1.48-1.35.93 1.66 3.78 2.921 5.261 2.3a6.203 6.203 0 01-2.33-.28c-.33-.16-.77-.51-.7-.57a5.802 5.803 0 005.902-.84c.44-.35.93-.94 1.07-.95-.2.32.04.16-.12.44.44-.72-.2-.3.46-1.24l.24.33c-.09-.6.74-1.321.66-2.262.19-.3.2.3 0 .97.29-.74.08-.85.15-1.46.08.2.18.42.23.63-.18-.7.2-1.2.28-1.6-.09-.05-.28.3-.32-.53 0-.37.1-.2.14-.28-.08-.05-.26-.32-.38-.861.08-.13.22.33.34.34-.08-.42-.2-.75-.2-1.08-.34-.68-.12.1-.4-.3-.34-1.091.3-.25.34-.74.54.77.84 1.96.981 2.46-.1-.6-.28-1.2-.49-1.76.16.07-.26-1.241.21-.37A7.823 7.824 0 0017.702 1.6c.18.17.42.39.33.42-.75-.45-.62-.48-.73-.67-.61-.25-.65.02-1.06 0C15.082.73 14.862.8 13.8.4l.05.23c-.77-.25-.9.1-1.73 0-.05-.04.27-.14.53-.18-.741.1-.701-.14-1.431.03.17-.13.36-.21.55-.32-.6.04-1.44.35-1.18.07C9.6.68 7.847 1.3 6.867 2.22L6.838 2c-.45.54-1.96 1.611-2.08 2.311l-.131.03c-.23.4-.38.85-.57 1.261-.3.52-.45.2-.4.28-.6 1.22-.9 2.251-1.16 3.102.18.27 0 1.65.07 2.76-.3 5.463 3.84 10.776 8.363 12.006.67.23 1.65.23 2.49.25-.99-.28-1.12-.15-2.08-.49-.7-.32-.85-.7-1.34-1.13l.2.35c-.971-.34-.57-.42-1.361-.67l.21-.27c-.31-.03-.83-.53-.97-.81l-.34.01c-.41-.501-.63-.871-.61-1.161l-.111.2c-.13-.21-1.52-1.901-.8-1.511-.13-.12-.31-.2-.5-.55l.14-.17c-.35-.44-.64-1.02-.62-1.2.2.24.32.3.45.33-.88-2.172-.93-.12-1.601-2.202l.15-.02c-.1-.16-.18-.34-.26-.51l.06-.6c-.63-.74-.18-3.102-.09-4.402.07-.54.53-1.1.88-1.981l-.21-.04c.4-.71 2.341-2.872 3.241-2.761.43-.55-.09 0-.18-.14.96-.991 1.26-.7 1.901-.88.7-.401-.6.16-.27-.151 1.2-.3.85-.7 2.421-.85.16.1-.39.14-.52.26 1-.49 3.151-.37 4.562.27 1.63.77 3.461 3.011 3.531 5.132l.08.02c-.04.85.13 1.821-.17 2.711l.2-.42M9.54 13.236l-.05.28c.26.35.47.73.8 1.01-.24-.47-.42-.66-.75-1.3m.62-.02c-.14-.15-.22-.34-.31-.52.08.32.26.6.43.88l-.12-.36m10.945-2.382l-.07.15c-.1.76-.34 1.511-.69 2.212.4-.73.65-1.541.75-2.362M12.45.12c.27-.1.66-.05.95-.12-.37.03-.74.05-1.1.1l.15.02M3.006 5.142c.07.57-.43.8.11.42.3-.66-.11-.18-.1-.42m-.64 2.661c.12-.39.15-.62.2-.84-.35.44-.17.53-.2.83"/>"#;
+    pub const RAW: &str = r#"<path fill="currentColor" d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zm4 18H6V4h7v5h5v11z"/>"#;
+    pub const GEMS: &str = r#"<path fill="currentColor" d="M7.81 7.9l-2.97 2.95 7.19 7.18 2.96-2.95 4.22-4.23-2.96-2.96v-.01H7.8zM12 0L1.53 6v12L12 24l10.47-6V6L12 0zm8.47 16.85L12 21.73l-8.47-4.88V7.12L12 2.24l8.47 4.88v9.73z"/>"#;
+    pub const TERRAFORM: &str = r#"<path fill="currentColor" d="M1.5 0v7.69l6.56 3.85V3.85L1.5 0zm7.94 4.62v7.69l6.56-3.84V.77L9.44 4.62zm7.94 0v7.69l6.56-3.84V.77l-6.56 3.85zM9.44 13.46v7.69l6.56-3.85v-7.69l-6.56 3.85z"/>"#;
+    pub const ANSIBLE: &str = r#"<path fill="currentColor" d="M10.617 11.473l4.686 3.695-3.102-7.662zM12 0C5.371 0 0 5.371 0 12s5.371 12 12 12 12-5.371 12-12S18.629 0 12 0zm5.797 17.305c-.011.471-.403.842-.875.83-.236 0-.416-.09-.664-.293l-6.19-5-2.079 5.203H6.191L11.438 5.44c.124-.314.427-.52.764-.506.326-.014.63.189.742.506l4.774 11.494c.045.111.08.234.08.348-.001.009-.001.009-.001.023z"/>"#;
+    pub const NUGET: &str = r#"<circle cx="7" cy="17" r="3.5" fill="currentColor"/><circle cx="16" cy="8.5" r="5" fill="currentColor"/><circle cx="4" cy="5" r="2" fill="currentColor"/>"#;
+    pub const CONAN: &str = r#"<path fill="currentColor" d="M11.709 0 0 5.534V16.76L11.984 24l4.857-2.706V9.998c.13-.084.275-.196.399-.27l.032-.017c.197-.11.329-.102.23.33v10.884l6.466-3.603V6.11L24 6.093Zm.915 2.83c.932.02 1.855.191 2.706.552 1.32.533 2.522 1.364 3.45 2.429a62.814 62.814 0 0 1-3.044 1.616c.56-.853.14-2.009-.76-2.455-.93-.648-2.093-.73-3.205-.674-1.064.175-2.258.51-2.893 1.474-.722.862-.084 2.11.914 2.408 1.2.509 2.543.38 3.806.413-.975.457-1.931.97-2.927 1.358-1.701-.176-3.585-.917-4.374-2.51-.574-1.178.215-2.572 1.319-3.14a11.426 11.426 0 0 1 3.336-1.348 9.212 9.212 0 0 1 1.672-.123Z"/>"#;
+    pub const PUB: &str = r#"<g><path fill="none" stroke="currentColor" d="M4.105 4.105v12.79c0 1.266.159 1.577.79 2.21L9.79 24h9.947v-4.263L4.105 4.105z"/><path fill="none" stroke="currentColor" d="M4.105 16.894c0 1.266.159 1.577.79 2.21l.632.632h14.21L4.105 4.105v12.79z"/><path fill="none" stroke="currentColor" d="M4.105 4.105L.316 12c-.135.287-.316.64-.316.95c0 .69.303 1.395.79 1.895l4.105 4.105c-.631-.633-.79-.944-.79-2.21V4.105z"/><path fill="none" stroke="currentColor" d="M5.053 19.263c-.631-.633-.79-.944-.79-2.21V4.263l-.158-.158v12.79c0 1.266.159 1.577.79 2.21l.632.632h0L5.053 19.263z"/><path fill="none" stroke="currentColor" d="M16.737 4.105H4.105l15.632 15.632H24V9.947l-5.053-5.053c-.711-.712-1.342-.79-2.21-.79z"/><path fill="none" stroke="currentColor" d="M18.947 4.895l-4.105-4.105C14.484.429 13.737 0 13.105 0c-.543 0-1.076.108-1.421.316L4.105 4.105h12.632c.868 0 1.499.078 2.21.79z"/><polygon fill="none" stroke="currentColor" points="23.842 9.79 23.842 19.579 19.579 19.579 19.737 19.737 24 19.737 24 9.947"/><path fill="none" stroke="currentColor" d="M18.947 4.895c-.783-.783-1.425-.79-2.368-.79H4.105l.158.158h12.316c.395 0 1.185-.079 1.895.632l.474.474z"/></g>"#;
+    pub const PYPI: &str = r#"<path fill="currentColor" d="M14.25.18l.9.2.73.26.59.3.45.32.34.34.25.34.16.33.1.3.04.26.02.2-.01.13V8.5l-.05.63-.13.55-.21.46-.26.38-.3.31-.33.25-.35.19-.35.14-.33.1-.3.07-.26.04-.21.02H8.83l-.69.05-.59.14-.5.22-.41.27-.33.32-.27.35-.2.36-.15.37-.1.35-.07.32-.04.27-.02.21v3.06H3.23l-.21-.03-.28-.07-.32-.12-.35-.18-.36-.26-.36-.36-.35-.46-.32-.59-.28-.73-.21-.88-.14-1.05L0 11.97l.06-1.22.16-1.04.24-.87.32-.71.36-.57.4-.44.42-.33.42-.24.4-.16.36-.1.32-.05.24-.01h.16l.06.01h8.16v-.83H6.24l-.01-2.75-.02-.37.05-.34.11-.31.17-.28.25-.26.31-.23.38-.2.44-.18.51-.15.58-.12.64-.1.71-.06.77-.04.84-.02 1.27.05 1.07.13zm-6.3 1.98l-.23.33-.08.41.08.41.23.34.33.22.41.09.41-.09.33-.22.23-.34.08-.41-.08-.41-.23-.33-.33-.22-.41-.09-.41.09-.33.22zM21.1 6.11l.28.06.32.12.35.18.36.27.36.35.35.47.32.59.28.73.21.88.14 1.04.05 1.23-.06 1.23-.16 1.04-.24.86-.32.71-.36.57-.4.45-.42.33-.42.24-.4.16-.36.09-.32.05-.24.02-.16-.01h-8.22v.82h5.84l.01 2.76.02.36-.05.34-.11.31-.17.29-.25.25-.31.24-.38.2-.44.17-.51.15-.58.13-.64.09-.71.07-.77.04-.84.01-1.27-.04-1.07-.14-.9-.2-.73-.25-.59-.3-.45-.33-.34-.34-.25-.34-.16-.33-.1-.3-.04-.25-.02-.2.01-.13v-5.34l.05-.64.13-.54.21-.46.26-.38.3-.32.33-.24.35-.2.35-.14.33-.1.3-.06.26-.04.21-.02.13-.01h5.84l.69-.05.59-.14.5-.21.41-.28.33-.32.27-.35.2-.36.15-.36.1-.35.07-.32.04-.28.02-.21V6.07h2.09l.14.01.21.03zm-6.47 14.25l-.23.33-.08.41.08.41.23.33.33.23.41.08.41-.08.33-.23.23-.33.08-.41-.08-.41-.23-.33-.33-.23-.41-.08-.41.08-.33.23z"/>"#;
+    pub const RPM: &str = r#"<path fill="currentColor" d="M16.009 13.386c1.577 0 3.86-.326 3.86-2.202a1.765 1.765 0 0 0-.04-.431l-.94-4.08c-.216-.898-.406-1.305-1.982-2.093-1.223-.625-3.888-1.658-4.676-1.658-.733 0-.947.946-1.822.946-.842 0-1.467-.706-2.255-.706-.757 0-1.25.515-1.63 1.576 0 0-1.06 2.99-1.197 3.424a.81.81 0 0 0-.028.245c0 1.162 4.577 4.974 10.71 4.974m4.101-1.435c.218 1.032.218 1.14.218 1.277 0 1.765-1.984 2.745-4.593 2.745-5.895.004-11.06-3.451-11.06-5.734a2.326 2.326 0 0 1 .19-.925C2.746 9.415 0 9.794 0 12.217c0 3.969 9.405 8.861 16.851 8.861 5.71 0 7.149-2.582 7.149-4.62 0-1.605-1.387-3.425-3.887-4.512"/>"#;
+    pub const CPAN: &str = r#"<path fill="currentColor" fill-rule="evenodd" d="M12.72 1.68h-.48l-.48.24L.96 15.84v.72l1.2 1.2 1.68.48.24 1.44.72.96 13.44.24 1.2-.96-.72-1.44v-.24l.96-.48.72.48.72-.24 1.2-.48.72-.72v-.72L14.64 6.24l.72-1.92-.24-.48-.48.24-3.36 6.24-.24.24-.24-.24.48-1.68 2.64-4.56v-.96l-.72-.48-4.56 6.48-4.8 5.04-1.92 1.68 6.72-7.44 4.32-6.24zM18.24 16.8H6.48l-.96.24-.96.72h-.24l7.2-6.72 1.2-1.44z"/>"#;
+}
+
+/// Format file size in human-readable format
+pub fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Escape HTML special characters
+pub fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Validate that a URL is safe to use in an `href` attribute.
+///
+/// Returns the trimmed URL if the scheme is `http` or `https` (case-insensitive),
+/// `None` otherwise. Strips leading ASCII control characters and whitespace
+/// to prevent bypass via `\x00javascript:` or `\tjavascript:` patterns.
+///
+/// # Security
+/// This prevents `javascript:`, `data:`, `vbscript:`, `blob:`, `file:` and
+/// other dangerous URI schemes from being rendered as clickable links.
+/// See: <https://github.com/nicholasgasior/nora/issues/522>
+pub fn sanitize_href(url: &str) -> Option<&str> {
+    // Strip leading ASCII control chars (0x00-0x1F, 0x7F) and whitespace
+    let trimmed = url.trim_start_matches(|c: char| c.is_ascii_control() || c.is_ascii_whitespace());
+
+    let bytes = trimmed.as_bytes();
+
+    // Check for https:// (8 bytes) or http:// (7 bytes) prefix, case-insensitive.
+    // All prefix chars are ASCII so byte comparison is safe and avoids char boundary issues.
+    let is_safe = (bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://"))
+        || (bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://"));
+    let result = if is_safe { Some(trimmed) } else { None };
+
+    // --- POSTCONDITION ---
+    debug_assert!(
+        result.is_none_or(|u| {
+            let lower = u.to_ascii_lowercase();
+            lower.starts_with("http://") || lower.starts_with("https://")
+        }),
+        "sanitize_href postcondition violated: result must start with http:// or https://"
+    );
+
+    result
+}
+
+/// Dynamic stats for the bragging footer (demo builds only).
+#[cfg(feature = "demo")]
+pub struct BraggingStats {
+    /// Binary size in MB (from /proc/self/exe).
+    pub binary_size_mb: u64,
+    /// Resident memory in MB (from /proc/self/status VmRSS).
+    pub memory_mb: u64,
+    /// Number of enabled registries.
+    pub registry_count: usize,
+    /// Startup duration in milliseconds.
+    pub startup_duration_ms: u64,
+}
+
+#[cfg(feature = "demo")]
+impl BraggingStats {
+    /// Collect live stats from the running process.
+    pub fn collect(registry_count: usize, startup_duration_ms: u64) -> Self {
+        let binary_size_mb = Self::read_binary_size().unwrap_or(32);
+        let memory_mb = Self::read_vmrss().unwrap_or(30);
+        Self {
+            binary_size_mb,
+            memory_mb,
+            registry_count,
+            startup_duration_ms,
+        }
+    }
+
+    /// Read binary size from /proc/self/exe (Linux only).
+    fn read_binary_size() -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::metadata("/proc/self/exe")
+                .ok()
+                .map(|m| m.len() / (1024 * 1024))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    /// Read VmRSS from /proc/self/status (Linux only).
+    fn read_vmrss() -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    let trimmed = rest.trim();
+                    // Format: "12345 kB"
+                    let kb_str = trimmed.split_whitespace().next()?;
+                    let kb: u64 = kb_str.parse().ok()?;
+                    return Some(kb / 1024);
+                }
+            }
+            None
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    fn format_startup(&self) -> String {
+        if self.startup_duration_ms < 1000 {
+            format!("{}ms", self.startup_duration_ms)
+        } else {
+            format!("{:.1}s", self.startup_duration_ms as f64 / 1000.0)
+        }
+    }
+}
+
+/// Render the "bragging" footer with NORA stats (demo builds only)
+#[cfg(feature = "demo")]
+pub fn render_bragging_footer(lang: Lang, stats: &BraggingStats) -> String {
+    let t = get_translations(lang);
+    format!(
+        r##"
+    <div class="mt-8 bg-gradient-to-r from-slate-800 to-slate-900 rounded-lg border border-slate-700 p-6">
+        <div class="text-center mb-4">
+            <span class="text-slate-400 text-sm uppercase tracking-wider">{built_for_speed}</span>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 text-center">
+            <div class="p-3">
+                <div class="text-2xl font-bold text-blue-400">{binary_size} MB</div>
+                <div class="text-xs text-slate-500 mt-1">{docker_image}</div>
+            </div>
+            <div class="p-3">
+                <div class="text-2xl font-bold text-green-400">{uptime}</div>
+                <div class="text-xs text-slate-500 mt-1">{cold_start}</div>
+            </div>
+            <div class="p-3">
+                <div class="text-2xl font-bold text-purple-400">~{memory} MB</div>
+                <div class="text-xs text-slate-500 mt-1">{mem_label}</div>
+            </div>
+            <div class="p-3">
+                <div class="text-2xl font-bold text-yellow-400">{reg_count}</div>
+                <div class="text-xs text-slate-500 mt-1">{reg_label}</div>
+            </div>
+            <div class="p-3">
+                <div class="text-2xl font-bold text-pink-400">{multi_arch}</div>
+                <div class="text-xs text-slate-500 mt-1">amd64 / arm64</div>
+            </div>
+            <div class="p-3">
+                <div class="text-2xl font-bold text-cyan-400">{zero_deps}</div>
+                <div class="text-xs text-slate-500 mt-1">{deps_label}</div>
+            </div>
+        </div>
+        <div class="text-center mt-4">
+            <span class="text-slate-500 text-xs">{tagline}</span>
+        </div>
+    </div>
+    "##,
+        built_for_speed = t.built_for_speed,
+        binary_size = stats.binary_size_mb,
+        docker_image = t.docker_image,
+        uptime = stats.format_startup(),
+        cold_start = t.cold_start,
+        memory = stats.memory_mb,
+        mem_label = t.memory,
+        reg_count = stats.registry_count,
+        reg_label = t.registries_count,
+        multi_arch = t.multi_arch,
+        zero_deps = t.zero_deps,
+        deps_label = t.deps_label,
+        tagline = t.tagline,
+    )
+}
+
+/// Format Unix timestamp as relative time
+pub fn format_timestamp(ts: u64) -> String {
+    if ts == 0 {
+        return "N/A".to_string();
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if now < ts {
+        return "just now".to_string();
+    }
+
+    let diff = now - ts;
+
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        let mins = diff / 60;
+        format!("{} min{} ago", mins, if mins == 1 { "" } else { "s" })
+    } else if diff < 86400 {
+        let hours = diff / 3600;
+        format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" })
+    } else if diff < 604800 {
+        let days = diff / 86400;
+        format!("{} day{} ago", days, if days == 1 { "" } else { "s" })
+    } else if diff < 2592000 {
+        let weeks = diff / 604800;
+        format!("{} week{} ago", weeks, if weeks == 1 { "" } else { "s" })
+    } else {
+        let months = diff / 2592000;
+        format!("{} month{} ago", months, if months == 1 { "" } else { "s" })
+    }
+}
+
+/// Format a future Unix timestamp as relative time ("in 28d") or past ("Expired").
+/// Returns `(display_text, is_expired)`.
+pub fn format_expiry(ts: u64) -> (String, bool) {
+    if ts == 0 {
+        return ("N/A".to_string(), false);
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if now >= ts {
+        // Expired
+        let diff = now - ts;
+        if diff < 3600 {
+            let mins = diff / 60;
+            return (
+                format!(
+                    "expired {} min{} ago",
+                    mins.max(1),
+                    if mins <= 1 { "" } else { "s" }
+                ),
+                true,
+            );
+        } else if diff < 86400 {
+            let hours = diff / 3600;
+            return (format!("expired {}h ago", hours), true);
+        } else {
+            let days = diff / 86400;
+            return (format!("expired {}d ago", days), true);
+        }
+    }
+
+    // Future
+    let diff = ts - now;
+    if diff < 3600 {
+        let mins = diff / 60;
+        (
+            format!("in {} min{}", mins.max(1), if mins <= 1 { "" } else { "s" }),
+            false,
+        )
+    } else if diff < 86400 {
+        let hours = diff / 3600;
+        (format!("in {}h", hours), false)
+    } else {
+        let days = diff / 86400;
+        (format!("in {}d", days), false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry_type::RegistryType;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    // #704: the sidebar nav must list exactly the enabled registries (matching the
+    // dashboard body). These exercise the `Some(&set)` filter branch — the same
+    // branch production takes (`layout_dark` passes the global set via
+    // `ENABLED_REGISTRIES.get()`). The thin `get()` glue itself is not unit-tested
+    // (trivial delegation); it is verified end-to-end against a running default
+    // instance. No test touches the `OnceLock` global, so there is no cross-test
+    // pollution.
+    fn enabled_set(regs: &[RegistryType]) -> HashSet<RegistryType> {
+        regs.iter().copied().collect()
+    }
+
+    #[test]
+    fn sidebar_lists_only_enabled_registries() {
+        let t = get_translations(Lang::En);
+        let set = enabled_set(&[RegistryType::Docker, RegistryType::Npm]);
+        let html = sidebar_dark_with_registries(Some("dashboard"), t, false, Some(&set));
+        assert!(html.contains("/ui/docker"), "enabled docker present");
+        assert!(html.contains("/ui/npm"), "enabled npm present");
+        assert!(!html.contains("/ui/gems"), "disabled gems absent");
+        assert!(!html.contains("/ui/conan"), "disabled conan absent");
+        assert!(!html.contains("/ui/rpm"), "disabled rpm absent");
+        assert!(!html.contains("/ui/deb"), "disabled deb absent");
+        assert!(html.contains("\"/ui/\""), "dashboard nav always present");
+    }
+
+    #[test]
+    fn sidebar_unset_filter_shows_all_formats() {
+        // `None` (the unit-test context where the global is never set) falls back
+        // to showing every supported format — preserves the documented fallback.
+        let t = get_translations(Lang::En);
+        let html = sidebar_dark_with_registries(Some("dashboard"), t, false, None);
+        assert!(html.contains("/ui/gems"), "fallback shows all formats");
+        assert!(html.contains("/ui/conan"));
+        assert!(html.contains("/ui/rpm"));
+        assert!(html.contains("/ui/deb"));
+        assert!(html.contains("/ui/docker"));
+    }
+
+    #[test]
+    fn sidebar_empty_enabled_set_hides_registries_section() {
+        // All-disabled config is reachable (config returns an empty set with only a
+        // warning); the sidebar shows Dashboard only — no lone "REGISTRIES" header.
+        let t = get_translations(Lang::En);
+        let set: HashSet<RegistryType> = HashSet::new();
+        let html = sidebar_dark_with_registries(Some("dashboard"), t, false, Some(&set));
+        assert!(!html.contains("/ui/docker"), "no registry items");
+        assert!(
+            !html.contains(t.nav_registries),
+            "no empty REGISTRIES header"
+        );
+        assert!(html.contains("\"/ui/\""), "dashboard still present");
+    }
+
+    #[test]
+    fn sanitize_href_allows_https() {
+        assert_eq!(
+            sanitize_href("https://example.com"),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_href_allows_http() {
+        assert_eq!(
+            sanitize_href("http://example.com"),
+            Some("http://example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_href_allows_mixed_case_https() {
+        assert_eq!(
+            sanitize_href("HTTPS://example.com"),
+            Some("HTTPS://example.com")
+        );
+        assert_eq!(
+            sanitize_href("Https://example.com"),
+            Some("Https://example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_href_allows_mixed_case_http() {
+        assert_eq!(
+            sanitize_href("HTTP://example.com"),
+            Some("HTTP://example.com")
+        );
+        assert_eq!(
+            sanitize_href("Http://example.com"),
+            Some("Http://example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_href_blocks_javascript() {
+        assert_eq!(sanitize_href("javascript:alert(1)"), None);
+        assert_eq!(sanitize_href("JAVASCRIPT:alert(1)"), None);
+        assert_eq!(sanitize_href("JavaScript:alert(document.cookie)"), None);
+    }
+
+    #[test]
+    fn sanitize_href_blocks_data() {
+        assert_eq!(
+            sanitize_href("data:text/html,<script>alert(1)</script>"),
+            None
+        );
+    }
+
+    #[test]
+    fn sanitize_href_blocks_vbscript() {
+        assert_eq!(sanitize_href("vbscript:MsgBox(1)"), None);
+    }
+
+    #[test]
+    fn sanitize_href_blocks_blob() {
+        assert_eq!(sanitize_href("blob:http://evil.com/uuid"), None);
+    }
+
+    #[test]
+    fn sanitize_href_blocks_file() {
+        assert_eq!(sanitize_href("file:///etc/passwd"), None);
+    }
+
+    #[test]
+    fn sanitize_href_strips_leading_control_chars() {
+        assert_eq!(sanitize_href("\x00javascript:alert(1)"), None);
+        assert_eq!(sanitize_href("\tjavascript:alert(1)"), None);
+        assert_eq!(sanitize_href("\njavascript:alert(1)"), None);
+        assert_eq!(sanitize_href("\x01javascript:alert(1)"), None);
+        assert_eq!(sanitize_href("\x7Fjavascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn sanitize_href_strips_leading_whitespace_for_valid() {
+        assert_eq!(
+            sanitize_href("  https://example.com"),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            sanitize_href("\thttps://example.com"),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn sanitize_href_blocks_empty_and_short() {
+        assert_eq!(sanitize_href(""), None);
+        assert_eq!(sanitize_href("http"), None);
+        assert_eq!(sanitize_href("http:/"), None);
+        // "http://" (7 bytes) passes — it's a valid http scheme prefix, not dangerous
+        assert_eq!(sanitize_href("http://"), Some("http://"));
+    }
+
+    #[test]
+    fn sanitize_href_blocks_relative_paths() {
+        assert_eq!(sanitize_href("/path/to/page"), None);
+        assert_eq!(sanitize_href("../other"), None);
+    }
+
+    #[test]
+    fn sanitize_href_blocks_ftp_ssh() {
+        assert_eq!(sanitize_href("ftp://example.com"), None);
+        assert_eq!(sanitize_href("ssh://git@github.com"), None);
+        assert_eq!(sanitize_href("git://github.com/repo"), None);
+    }
+
+    proptest! {
+        #[test]
+        fn sanitize_href_never_returns_non_http(input in "\\PC{0,200}") {
+            if let Some(result) = sanitize_href(&input) {
+                let lower = result.to_ascii_lowercase();
+                prop_assert!(
+                    lower.starts_with("http://") || lower.starts_with("https://"),
+                    "sanitize_href returned non-http URL: {}", result
+                );
+            }
+        }
+
+        #[test]
+        fn sanitize_href_preserves_valid_http(suffix in "[a-zA-Z0-9./-]{1,100}") {
+            let url = format!("https://{}", suffix);
+            prop_assert_eq!(sanitize_href(&url), Some(url.as_str()));
+        }
+
+        #[test]
+        fn sanitize_href_rejects_arbitrary_scheme(
+            scheme in "[a-zA-Z]{1,20}",
+            body in "\\PC{0,100}"
+        ) {
+            let lower = scheme.to_ascii_lowercase();
+            if lower != "http" && lower != "https" {
+                let url = format!("{}://{}", scheme, body);
+                prop_assert_eq!(sanitize_href(&url), None, "should reject scheme: {}", scheme);
+            }
+        }
+    }
+}

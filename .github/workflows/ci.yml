@@ -1,0 +1,461 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+
+permissions: read-all
+
+jobs:
+  conventional-commits:
+    name: Conventional Commits
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            chore
+            ci
+            refactor
+            perf
+            test
+            security
+          requireScope: false
+          subjectPattern: ^.+$
+          subjectPatternError: "PR title must follow conventional commits: type(scope): description"
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: moderate
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: crate-ci/typos@7c572958218557a3272c2d6719629443b5cc26fd # v1.45.2
+
+  coherence:
+    name: Coherence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Run coherence check
+        run: ./scripts/coherence-check.sh
+      - name: Verify changelog claims
+        run: ./scripts/verify-changelog.sh
+      - name: Reland FileChanges builder — large-PR regression
+        run: ./scripts/test-reland-filechanges.sh
+      - name: Diff-coverage helper self-test
+        run: bash scripts/test-diff-coverage.sh
+      # The self-test runs first on purpose: lock-audit is a heuristic over source text,
+      # and a broken one prints nothing — indistinguishable from a clean tree. It also
+      # runs the audit under every awk on the image, so a gawk-only construct creeping
+      # back in fails here instead of quietly disabling the check (#979).
+      - name: Lock audit self-test
+        run: bash scripts/test-lock-audit.sh
+      - name: Lock audit — publish_lock consistency
+        run: bash scripts/lock-audit.sh
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --package nora-registry --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --package nora-registry
+
+
+  lint-workflows:
+    name: Lint Workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install actionlint
+        run: |
+          ACTIONLINT_VERSION=1.7.12
+          curl -sLO "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          tar xzf "actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" actionlint
+      - name: Run actionlint
+        run: ./actionlint -ignore "shellcheck reported issue" -ignore "SC[0-9]"
+
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    # Run on every PR (so the fail-under floor actually gates merges) and on
+    # main pushes (to refresh the badge). Previously main-push-only, so the
+    # floor never ran on the PRs it was meant to protect.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Install tarpaulin
+        # Pinned: 0.37.4 aborts the run with "Timed out waiting for test response"
+        # on an unchanged main; 0.37.2 passes. Unpin once a newer release does.
+        run: cargo install --locked --version 0.37.2 cargo-tarpaulin
+
+      - name: Run coverage
+        # No pipe: tarpaulin's exit code (non-zero when coverage < fail-under)
+        # must reach the runner. The old `| tee` masked it behind tee's exit 0,
+        # so the fail-under floor never failed the build.
+        run: |
+          cargo tarpaulin --config tarpaulin.toml
+          COVERAGE=$(python3 -c "import json; d=json.load(open('coverage/tarpaulin-report.json')); print(f\"{d['coverage']:.1f}\")")
+          echo "COVERAGE=$COVERAGE" >> $GITHUB_ENV
+          echo "Coverage: $COVERAGE%"
+
+      - name: Update coverage badge
+        # Badge needs the GIST_TOKEN secret and only makes sense for the
+        # canonical branch — skip on PRs (incl. forks without secrets).
+        # Cosmetic: a stale/expired GIST_TOKEN (e.g. a 401) must not fail the
+        # Coverage gate — the real fail-under check is the "Run coverage" step.
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        continue-on-error: true
+        uses: schneegans/dynamic-badges-action@0e50b8bad39e7e1afd3e4e9c2b7dd145fad07501 # v1.8.0
+        with:
+          auth: ${{ secrets.GIST_TOKEN }}
+          gistID: ${{ vars.COVERAGE_GIST_ID }}
+          filename: nora-coverage.json
+          label: coverage
+          message: ${{ env.COVERAGE }}%
+          valColorRange: ${{ env.COVERAGE }}
+          minColorRange: 0
+          maxColorRange: 100
+
+  coverage-diff:
+    name: Coverage (diff)
+    runs-on: ubuntu-latest
+    # Diff-scoped gate: fails the PR when the incremental coverage of changed
+    # .rs lines drops below the threshold, independent of the global fail-under
+    # floor enforced by the `coverage` job above (left untouched).
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Install tarpaulin
+        # Pinned: 0.37.4 aborts the run with "Timed out waiting for test response"
+        # on an unchanged main; 0.37.2 passes. Unpin once a newer release does.
+        run: cargo install --locked --version 0.37.2 cargo-tarpaulin
+
+      - name: Run coverage
+        run: cargo tarpaulin --config tarpaulin.toml --fail-under 0
+
+      - name: Diff-scoped coverage gate
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          LCOV=$(find coverage -type f \( -name "*.lcov" -o -name "lcov.info" \) | head -1)
+          if [ -z "$LCOV" ]; then echo "No lcov file found" >&2; exit 1; fi
+          python3 scripts/diff-coverage.py --lcov "$LCOV" --base "${BASE}"
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      # ── Secrets ────────────────────────────────────────────────────────────
+      - name: Gitleaks — scan for hardcoded secrets
+        run: |
+          curl -sL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
+            | tar xz -C /usr/local/bin gitleaks
+          gitleaks detect --source . --config .gitleaks.toml --exit-code 1 --report-format sarif --report-path gitleaks.sarif
+
+      # ── CVE in Rust dependencies ────────────────────────────────────────────
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit — RustSec advisory database
+        run: |
+          # RUSTSEC-2025-0119: unmaintained crate, no fix available, transitive dep
+          # RUSTSEC-2023-0071: Marvin Attack (RSA timing side-channel) — not applicable:
+          #   NORA uses rsa crate only for JWT signature *verification* via jsonwebtoken.
+          #   Marvin Attack targets RSA PKCS#1 v1.5 *decryption*, a different code path.
+          #   No upstream patch exists. See: SECURITY.md
+          # RUSTSEC-2026-0194 / -0195: quick-xml <0.41 quadratic-attribute + NsReader
+          #   memory-exhaustion DoS. Transitive via object_store (S3 XML response parsing).
+          #   No upstream fix yet — object_store 0.14 still pins quick-xml ^0.40.1 (<0.41),
+          #   which is also affected. Exposure is low: the parsed XML comes from the
+          #   operator's configured S3 backend, not attacker-controlled input. Remove when
+          #   object_store ships a release using quick-xml >=0.41. Tracking: #799
+          cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+          cargo audit --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --json > /tmp/audit.json || true
+
+      - name: Upload cargo-audit results as SARIF
+        if: always()
+        run: |
+          python3 -c "
+          import json, sys
+          sarif = {
+            'version': '2.1.0',
+            '\$schema': 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json',
+            'runs': [{'tool': {'driver': {'name': 'cargo-audit', 'version': '0.21', 'informationUri': 'https://github.com/rustsec/rustsec'}}, 'results': []}]
+          }
+          with open('cargo-audit.sarif', 'w') as f:
+            json.dump(sarif, f)
+          "
+
+      - name: Upload SAST results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9 # v4
+        if: always()
+        with:
+          sarif_file: cargo-audit.sarif
+          category: cargo-audit
+
+      # ── Licenses, banned crates, supply chain policy ────────────────────────
+      - name: cargo deny — licenses and banned crates
+        uses: EmbarkStudios/cargo-deny-action@a4d2d701318fdc1c6ae17ba8cea8f329c5110eb2 # v2.0.17
+        with:
+          command: check
+          arguments: --all-features
+
+      # ── CVE scan of source tree and Cargo.lock ──────────────────────────────
+      - name: Trivy — filesystem scan (Cargo.lock + source)
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          trivyignores: .trivyignore
+
+      - name: Upload Trivy fs results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9 # v4
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  semver:
+    name: Semver
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
+        with:
+          package: nora-registry
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Build NORA
+        run: cargo build --release --package nora-registry
+
+      - name: Start NORA
+        run: |
+          NORA_STORAGE_PATH=/tmp/nora-data ./target/release/nora &
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:4000/health && break || sleep 2
+          done
+          curl -sf http://localhost:4000/health | jq .
+
+      - name: Configure Docker for insecure registry
+        run: |
+          echo '{"insecure-registries": ["localhost:4000"]}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sleep 2
+
+      - name: Docker — push and pull image
+        run: |
+          docker pull alpine:3.20
+          docker tag alpine:3.20 localhost:4000/test/alpine:integration
+          docker push localhost:4000/test/alpine:integration
+          docker rmi localhost:4000/test/alpine:integration
+          docker pull localhost:4000/test/alpine:integration
+          echo "Docker push/pull OK"
+
+      - name: Docker — verify catalog and tags
+        run: |
+          curl -sf http://localhost:4000/v2/_catalog | jq .
+          curl -sf http://localhost:4000/v2/test/alpine/tags/list | jq .
+
+      - name: npm — verify registry endpoint
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/npm/lodash)
+          echo "npm endpoint returned: $STATUS"
+          [ "$STATUS" != "000" ] && echo "npm endpoint OK" || (echo "npm endpoint unreachable" && exit 1)
+
+      - name: Maven — deploy and download artifact
+        run: |
+          echo "test-artifact-content-$(date +%s)" > /tmp/test-artifact.jar
+          CHECKSUM=$(sha256sum /tmp/test-artifact.jar | cut -d' ' -f1)
+          curl -sf -X PUT --data-binary @/tmp/test-artifact.jar \
+            http://localhost:4000/maven2/com/example/test-lib/1.0.0/test-lib-1.0.0.jar
+          curl -sf -o /tmp/downloaded.jar \
+            http://localhost:4000/maven2/com/example/test-lib/1.0.0/test-lib-1.0.0.jar
+          DOWNLOAD_CHECKSUM=$(sha256sum /tmp/downloaded.jar | cut -d' ' -f1)
+          [ "$CHECKSUM" = "$DOWNLOAD_CHECKSUM" ] && echo "Maven deploy/download OK" || (echo "Checksum mismatch!" && exit 1)
+
+      - name: PyPI — verify simple index
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/simple/)
+          echo "PyPI simple index returned: $STATUS"
+          [ "$STATUS" = "200" ] && echo "PyPI endpoint OK" || (echo "Expected 200, got $STATUS" && exit 1)
+
+      - name: Cargo — verify registry API responds
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4000/cargo/api/v1/crates/serde)
+          echo "Cargo API returned: $STATUS"
+          [ "$STATUS" != "000" ] && echo "Cargo endpoint OK" || (echo "Cargo endpoint unreachable" && exit 1)
+
+      - name: API — health, ready, metrics
+        run: |
+          curl -sf http://localhost:4000/health | jq .status
+          curl -sf http://localhost:4000/ready
+          curl -sf http://localhost:4000/metrics | head -5
+          echo "API checks OK"
+
+      - name: Negative — Maven immutable release rejects re-deploy
+        run: |
+          echo "first-deploy" > /tmp/immutable.jar
+          curl -sf -X PUT --data-binary @/tmp/immutable.jar \
+            http://localhost:4000/maven2/com/example/immutable/1.0.0/immutable-1.0.0.jar
+          echo "second-deploy" > /tmp/immutable2.jar
+          STATUS=$(curl -s -o /tmp/neg-body.txt -w "%{http_code}" \
+            -X PUT --data-binary @/tmp/immutable2.jar \
+            http://localhost:4000/maven2/com/example/immutable/1.0.0/immutable-1.0.0.jar)
+          echo "Re-deploy returned: $STATUS (body: $(cat /tmp/neg-body.txt))"
+          if [ "$STATUS" = "409" ]; then
+            echo "Immutable release OK — re-deploy rejected with 409"
+          else
+            echo "Expected 409 Conflict, got $STATUS"
+            exit 1
+          fi
+
+      - name: Negative — GET nonexistent tag returns 404
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://localhost:4000/v2/nonexistent/repo/manifests/v999)
+          echo "Nonexistent tag returned: $STATUS"
+          [ "$STATUS" = "404" ] && echo "404 OK" || (echo "Expected 404, got $STATUS" && exit 1)
+
+      - name: Stop NORA
+        if: always()
+        run: pkill nora || true
+
+  # ── PR test image — alpine amd64 only, non-fork PRs ───────────────────
+  # Pushes ghcr.io/getnora-io/nora:pr-<number> so reviewers and
+  # contributors can `docker pull` and test without building locally.
+  # Skipped for forks (no packages:write token) and main pushes.
+  pr-image:
+    name: PR Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (alpine amd64)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}
+
+      - name: Comment image tag on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body "🐳 Test image pushed: \`ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}\`
+          \`\`\`bash
+          docker pull ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}
+          docker run --rm -p 4000:4000 ghcr.io/${{ github.repository }}:pr-${{ github.event.pull_request.number }}
+          \`\`\`"

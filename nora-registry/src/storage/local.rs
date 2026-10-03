@@ -1,0 +1,922 @@
+// Copyright (c) 2026 The NORA Authors
+// SPDX-License-Identifier: MIT
+
+use async_trait::async_trait;
+use axum::body::Bytes;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::fs;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+use super::{FileMeta, Result, StorageBackend, StorageError};
+use crate::hash_pin_store::HashPinStore;
+
+/// The hash-pin sidecar is backend bookkeeping, not a stored artifact: it is
+/// held out of listings and the size gauge, like the `tmp/` staging directory.
+const PIN_FILE: &str = ".nora-pins.ndjson";
+
+/// Monotonic counter for unique temp file names (atomic — no collisions).
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A temp path next to `path` that no other write in this or any other process uses:
+/// PID + monotonic counter. Concurrent writers of one key each stage their own copy
+/// and only the final `rename` publishes it, so a reader never sees a partial file.
+/// Relaxed ordering: the counter only makes names unique, it orders nothing.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("tmp.{}.{}", std::process::id(), seq))
+}
+
+/// fsync the parent directory of `path` so the directory entry written by a
+/// just-completed `rename` is durable across power-loss. The file's own data is
+/// fsync'd (`sync_all`) before the rename; the rename only becomes crash-durable
+/// once the *parent directory* is also fsync'd. Without this, a power-loss after
+/// `Ok` was returned can leave the file missing (or the old version) — violating
+/// the "Ok implies durable" contract (L3 durability). Fails closed: a parent that
+/// cannot be fsync'd means durability is not guaranteed, so we return Err.
+async fn sync_parent_dir(path: &Path) -> Result<()> {
+    // Windows：File::open 打开目录需要 FILE_FLAG_BACKUP_SEMANTICS，
+    // 且 FlushFileBuffers 对目录句柄不可靠，NTFS 的目录条目耐久性由
+    // 文件系统日志保证——直接跳过，避免 put 误报 Access Denied。
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(parent) = path.parent() {
+            let dir = fs::File::open(parent).await?;
+            dir.sync_all().await?;
+        }
+        Ok(())
+    }
+}
+
+/// Local filesystem storage backend (zero-config default). Hash pins live in an
+/// NDJSON sidecar next to the artifacts.
+pub struct LocalStorage {
+    base_path: PathBuf,
+    pins: Arc<HashPinStore>,
+}
+
+impl LocalStorage {
+    pub fn new(path: &str) -> Self {
+        let base_path = PathBuf::from(path);
+        let pins = Arc::new(HashPinStore::new(base_path.join(PIN_FILE)));
+        Self { base_path, pins }
+    }
+
+    /// Record `sha256` for `key`, on the blocking pool (the append is
+    /// filesystem I/O). Fails closed: an artifact whose pin did not reach the
+    /// disk would silently downgrade to open-world after the next restart — the
+    /// #582/#604 bypass — so the write reports failure instead.
+    ///
+    /// On an immutable registry the client's retry hits the 409 guard and never
+    /// re-runs this, so the orphaned body stays unpinned until an operator
+    /// `repin`s it — still strictly better than a silent success.
+    async fn record_pin(&self, key: &str, sha256: &str) -> Result<()> {
+        let pins = Arc::clone(&self.pins);
+        let key_owned = key.to_string();
+        let hash = sha256.to_ascii_lowercase();
+        tokio::task::spawn_blocking(move || pins.record_hash(&key_owned, &hash))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+            .map_err(|e| {
+                tracing::error!(error = %e, key = %key, "hash-pin record failed");
+                StorageError::Io(std::io::Error::other(format!(
+                    "hash-pin record failed: {e}"
+                )))
+            })
+    }
+
+    fn key_to_path(&self, key: &str) -> PathBuf {
+        // Windows 文件名禁止 ':'（NTFS 数据流分隔符），Docker digest "sha256:<hex>"
+        // 直接进 key 导致缓存写入失败（os error 123/87/5）。仅在 Windows 转义，
+        // 读写都经过此函数，天然一致；%3A 与 object.rs 中 @→%40 的编码风格一致。
+        #[cfg(windows)]
+        let key = key.replace(':', "%3A");
+        self.base_path.join(key)
+    }
+
+    /// Recursively list all files under a directory (sync helper)
+    fn list_files_sync(dir: &PathBuf, base: &PathBuf, prefix: &str, results: &mut Vec<String>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Ok(rel_path) = path.strip_prefix(base) {
+                        let key = rel_path.to_string_lossy().replace('\\', "/");
+                        #[cfg(windows)]
+                        let key = key.replace("%3A", ":");
+                        if key != PIN_FILE
+                            && !super::is_reserved_signing_key(&key)
+                            && (key.starts_with(prefix) || prefix.is_empty())
+                        {
+                            results.push(key);
+                        }
+                    }
+                } else if path.is_dir() {
+                    Self::list_files_sync(&path, base, prefix, results);
+                }
+            }
+        }
+    }
+
+    /// Like [`Self::list_files_sync`] but also captures size/mtime from each
+    /// file's metadata during the walk, so callers do not need a follow-up
+    /// `stat()` per key (#738). Uses `std::fs::metadata` (symlink-following) to
+    /// match the semantics of [`StorageBackend::stat`].
+    fn list_files_with_meta_sync(
+        dir: &PathBuf,
+        base: &PathBuf,
+        prefix: &str,
+        results: &mut Vec<(String, FileMeta)>,
+    ) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(metadata) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                if metadata.is_file() {
+                    if let Ok(rel_path) = path.strip_prefix(base) {
+                        let key = rel_path.to_string_lossy().replace('\\', "/");
+                        #[cfg(windows)]
+                        let key = key.replace("%3A", ":");
+                        if key != PIN_FILE
+                            && !super::is_reserved_signing_key(&key)
+                            && (key.starts_with(prefix) || prefix.is_empty())
+                        {
+                            let modified = metadata
+                                .modified()
+                                .ok()
+                                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            results.push((
+                                key,
+                                FileMeta {
+                                    size: metadata.len(),
+                                    modified,
+                                },
+                            ));
+                        }
+                    }
+                } else if metadata.is_dir() {
+                    Self::list_files_with_meta_sync(&path, base, prefix, results);
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl StorageBackend for LocalStorage {
+    async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+        let path = self.key_to_path(key);
+
+        // Create parent directories
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        // Atomic write: create temp file in same directory, write, rename.
+        // This prevents readers from seeing partial/truncated data during write.
+        let tmp = unique_tmp_path(&path);
+        let write_result: Result<()> = async {
+            let mut file = fs::File::create(&tmp).await?;
+            file.write_all(data).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            fs::rename(&tmp, &path).await?;
+            // Durability: make the rename's directory entry survive power-loss.
+            sync_parent_dir(&path).await?;
+            Ok(())
+        }
+        .await;
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp).await;
+        }
+        write_result?;
+        self.record_pin(key, sha256).await
+    }
+
+    async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+        let path = self.key_to_path(key);
+
+        let mut file = fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer).await?;
+
+        Ok((Bytes::from(buffer), self.pins.get(key)))
+    }
+
+    async fn pin(&self, key: &str) -> Option<String> {
+        self.pins.get(key)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let path = self.key_to_path(key);
+
+        fs::remove_file(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+
+        // A lost tombstone is fail-safe — a stale pin at worst yields a future
+        // IntegrityViolation, healable via `repin` — so the delete still
+        // reports success: the authoritative action (byte removal) is done.
+        let pins = Arc::clone(&self.pins);
+        let key_owned = key.to_string();
+        if let Err(e) = tokio::task::spawn_blocking(move || pins.remove(&key_owned))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+        {
+            tracing::warn!(
+                error = %e,
+                key = %key,
+                "hash-pin tombstone write failed; stale pin left (repin to heal)"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let base = self.base_path.clone();
+        let prefix = prefix.to_string();
+
+        // Use blocking task for filesystem traversal
+        tokio::task::spawn_blocking(move || {
+            let mut results = Vec::new();
+            if base.exists() {
+                Self::list_files_sync(&base, &base, &prefix, &mut results);
+            }
+            results.sort();
+            results
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))
+    }
+
+    async fn list_with_meta(&self, prefix: &str) -> Result<Vec<(String, FileMeta)>> {
+        let base = self.base_path.clone();
+        let prefix = prefix.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let mut results = Vec::new();
+            if base.exists() {
+                Self::list_files_with_meta_sync(&base, &base, &prefix, &mut results);
+            }
+            results.sort_by(|a, b| a.0.cmp(&b.0));
+            results
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(format!("list task panicked: {e}"))))
+    }
+
+    async fn stat(&self, key: &str) -> Option<FileMeta> {
+        let path = self.key_to_path(key);
+        let metadata = fs::metadata(&path).await.ok()?;
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(FileMeta {
+            size: metadata.len(),
+            modified,
+        })
+    }
+
+    async fn health_check(&self) -> bool {
+        // A real write-probe — `base_path.exists()` is not a health signal: a
+        // read-only mount or a full disk where the directory already exists would
+        // still report healthy. Create + write + fsync + remove a unique temp
+        // file; only a genuinely writable backing store passes.
+        if fs::create_dir_all(&self.base_path).await.is_err() {
+            return false;
+        }
+        let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let probe =
+            self.base_path
+                .join(format!(".nora-health-probe.{}.{}", std::process::id(), seq));
+        let writable = match fs::File::create(&probe).await {
+            Ok(mut file) => file.write_all(b"ok").await.is_ok() && file.sync_all().await.is_ok(),
+            Err(_) => false,
+        };
+        let _ = fs::remove_file(&probe).await; // best-effort cleanup
+        writable
+    }
+
+    async fn total_size(&self) -> u64 {
+        let base = self.base_path.clone();
+        tokio::task::spawn_blocking(move || {
+            fn dir_size(path: &std::path::Path, is_root: bool) -> u64 {
+                let mut total = 0u64;
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() {
+                            if is_root && path.file_name().is_some_and(|n| n == PIN_FILE) {
+                                continue;
+                            }
+                            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        } else if path.is_dir() {
+                            // `<root>/tmp/` holds in-flight streamed uploads —
+                            // transient staging, not stored artifacts; counting
+                            // it makes the storage gauge sawtooth during pushes.
+                            if is_root && path.file_name().is_some_and(|n| n == "tmp") {
+                                continue;
+                            }
+                            total += dir_size(&path, false);
+                        }
+                    }
+                }
+                total
+            }
+            dir_size(&base, true)
+        })
+        .await
+        .unwrap_or(0)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "local"
+    }
+
+    async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()> {
+        let dest = self.key_to_path(key);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        // Try atomic rename first; fall back to streaming copy on EXDEV
+        // (cross-device link — src and dest on different filesystems).
+        match fs::rename(src, &dest).await {
+            Ok(()) => {
+                // Durability: make the rename's directory entry survive power-loss.
+                sync_parent_dir(&dest).await?;
+            }
+            Err(e) if e.raw_os_error() == Some(18 /* EXDEV */) => {
+                let mut reader = fs::File::open(src).await?;
+                // Each writer stages its own copy: two fills of one blob must not share
+                // (and truncate, and rename away) one temp file.
+                let tmp = unique_tmp_path(&dest);
+                let mut writer = fs::File::create(&tmp).await?;
+                let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB chunks
+                let copy_result: Result<()> = async {
+                    loop {
+                        let n = reader.read(&mut buf).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        writer.write_all(&buf[..n]).await?;
+                    }
+                    writer.flush().await?;
+                    // Durability: fsync the copied data before publishing it.
+                    // flush() only pushes to the OS; sync_all() makes it crash-
+                    // durable, matching the put() path (the direct-rename branch
+                    // relies on the caller having fsync'd src).
+                    writer.sync_all().await?;
+                    fs::rename(&tmp, &dest).await?;
+                    // Durability: make the rename's directory entry durable.
+                    sync_parent_dir(&dest).await?;
+                    Ok(())
+                }
+                .await;
+                if copy_result.is_err() {
+                    let _ = fs::remove_file(&tmp).await;
+                }
+                copy_result?;
+                let _ = fs::remove_file(src).await;
+            }
+            Err(e) => return Err(StorageError::Io(e)),
+        }
+        match sha256 {
+            Some(hash) => self.record_pin(key, hash).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
+        let src_path = self.key_to_path(src);
+        let dst_path = self.key_to_path(dst);
+        if let Some(parent) = dst_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        // Hard link: the two keys share one inode, so a mounted blob costs no
+        // extra bytes and cannot drift from its source.
+        let linked = match fs::hard_link(&src_path, &dst_path).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&dst_path).await?;
+                fs::hard_link(&src_path, &dst_path).await
+            }
+            other => other,
+        };
+        match linked {
+            Ok(()) => sync_parent_dir(&dst_path).await?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound)
+            }
+            // Cross-device, or a filesystem without links — copy the bytes.
+            Err(_) => {
+                fs::copy(&src_path, &dst_path).await.map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        StorageError::NotFound
+                    } else {
+                        StorageError::Io(e)
+                    }
+                })?;
+                sync_parent_dir(&dst_path).await?;
+            }
+        }
+        match sha256
+            .map(str::to_ascii_lowercase)
+            .or_else(|| self.pins.get(src))
+        {
+            Some(hash) => self.record_pin(dst, &hash).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn get_reader(
+        &self,
+        key: &str,
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        let path = self.key_to_path(key);
+        let file = fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+        let meta = file.metadata().await?;
+        Ok((meta.len(), self.pins.get(key), Box::pin(file)))
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let path = self.key_to_path(key);
+        let mut file = fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::NotFound
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+        let size = file.metadata().await?.len();
+        if start > 0 {
+            file.seek(std::io::SeekFrom::Start(start)).await?;
+        }
+        let len = end.saturating_sub(start) + 1;
+        Ok((size, Box::pin(file.take(len))))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+
+    /// The backend pins what it stores, so every test write carries the digest
+    /// of its own bytes.
+    async fn put(storage: &LocalStorage, key: &str, data: &[u8]) -> Result<()> {
+        storage
+            .put(key, data, &hex::encode(Sha256::digest(data)))
+            .await
+    }
+
+    async fn get(storage: &LocalStorage, key: &str) -> Result<Bytes> {
+        storage.get(key).await.map(|(data, _pin)| data)
+    }
+
+    /// `put_from_path` across filesystems (EXDEV: the spool on tmpfs, storage on disk)
+    /// copies through a temp file. Concurrent writes of one key — two proxy fills of the
+    /// same blob — must each succeed, never publish a torn blob to a reader, and leave
+    /// no temp file behind. Skipped where no second filesystem is available.
+    #[tokio::test]
+    async fn concurrent_cross_device_put_from_path_is_atomic() {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(src_dir) = TempDir::new_in("/dev/shm") else {
+            eprintln!("skip: /dev/shm unavailable, cannot force EXDEV");
+            return;
+        };
+        let store_dir = TempDir::new().unwrap();
+        let (a, b) = (
+            std::fs::metadata(src_dir.path()).unwrap().dev(),
+            std::fs::metadata(store_dir.path()).unwrap().dev(),
+        );
+        if a == b {
+            eprintln!("skip: /dev/shm and the temp dir share a filesystem, no EXDEV");
+            return;
+        }
+        let storage = Arc::new(LocalStorage::new(store_dir.path().to_str().unwrap()));
+        let data: Arc<Vec<u8>> =
+            Arc::new((0..8 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect());
+        let key = "docker/library/test/blobs/sha256:same";
+        let dest = storage.key_to_path(key);
+
+        let (reader_dest, reader_data) = (dest.clone(), Arc::clone(&data));
+        let reader = tokio::spawn({
+            let (dest, data) = (reader_dest, reader_data);
+            async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(seen) = tokio::fs::read(&dest).await {
+                        assert_eq!(seen.len(), data.len(), "a reader saw a torn blob");
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let mut writers = Vec::new();
+        for i in 0..8 {
+            let src = src_dir.path().join(format!("spool-{i}"));
+            std::fs::write(&src, data.as_slice()).unwrap();
+            let storage = Arc::clone(&storage);
+            let handle = tokio::spawn(async move { storage.put_from_path(key, &src, None).await });
+            writers.push(handle);
+        }
+        for writer in writers {
+            writer
+                .await
+                .unwrap()
+                .expect("every concurrent write succeeds");
+        }
+        reader.await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), *data);
+        let leftovers: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_and_get() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        put(&storage, "test/key", b"test data").await.unwrap();
+        let data = get(&storage, "test/key").await.unwrap();
+        assert_eq!(&*data, b"test data");
+    }
+
+    #[tokio::test]
+    async fn test_get_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        let result = get(&storage, "nonexistent").await;
+        assert!(matches!(result, Err(StorageError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_list_with_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        put(&storage, "docker/image/blob1", b"data1").await.unwrap();
+        put(&storage, "docker/image/blob2", b"data2").await.unwrap();
+        put(&storage, "maven/artifact", b"data3").await.unwrap();
+
+        let docker_keys = storage.list("docker/").await.unwrap();
+        assert_eq!(docker_keys.len(), 2);
+        assert!(docker_keys.iter().all(|k| k.starts_with("docker/")));
+
+        let all_keys = storage.list("").await.unwrap();
+        assert_eq!(all_keys.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_excludes_signing_key() {
+        // The repository signing key lives at `<storage.path>/.signing/nora.key`
+        // (main.rs default) and is persisted owner-only (0600, signing.rs:182). It is
+        // a SECRET, not an artifact: list() must never enumerate it, or backup/migrate/
+        // GC/UI would leak it (0644 tarball / plaintext S3 object) or GC could delete
+        // the signing identity. Regression guard for the #891-class export leak.
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        put(&storage, "npm/left-pad/-/left-pad-1.0.0.tgz", b"artifact")
+            .await
+            .unwrap();
+        std::fs::create_dir_all(temp_dir.path().join(".signing")).unwrap();
+        std::fs::write(temp_dir.path().join(".signing/nora.key"), b"SECRET-KEY").unwrap();
+
+        let all = storage.list("").await.unwrap();
+        assert!(
+            all.iter().any(|k| k.contains("left-pad")),
+            "real artifact must still be listed: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|k| k.starts_with(".signing/")),
+            "signing key must never be enumerated by list(\"\"): {all:?}"
+        );
+
+        // Even an explicit prefix must not surface it.
+        let signing = storage.list(".signing/").await.unwrap();
+        assert!(
+            signing.is_empty(),
+            "explicit .signing/ prefix must still exclude the key: {signing:?}"
+        );
+
+        // list_with_meta shares the walk — it must exclude it too.
+        let meta = storage.list_with_meta("").await.unwrap();
+        assert!(
+            !meta.iter().any(|(k, _)| k.starts_with(".signing/")),
+            "list_with_meta must exclude the signing key: {:?}",
+            meta.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stat() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        put(&storage, "test", b"12345").await.unwrap();
+        let meta = storage.stat("test").await.unwrap();
+        assert_eq!(meta.size, 5);
+        assert!(meta.modified > 0);
+    }
+
+    #[tokio::test]
+    async fn test_stat_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        let meta = storage.stat("nonexistent").await;
+        assert!(meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        assert!(storage.health_check().await);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_creates_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let new_path = temp_dir.path().join("new_storage");
+        let storage = LocalStorage::new(new_path.to_str().unwrap());
+
+        assert!(!new_path.exists());
+        assert!(storage.health_check().await);
+        assert!(new_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_fails_when_unwritable() {
+        // base_path *under a regular file* can't be created or written: `open`
+        // fails with ENOTDIR — a structural error the kernel returns even to
+        // root, unlike a chmod'd read-only dir which root bypasses via
+        // DAC_OVERRIDE. The old `exists()`-only check would have missed this.
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let storage = LocalStorage::new(file.join("store").to_str().unwrap());
+        assert!(
+            !storage.health_check().await,
+            "an unwritable backing store must report unhealthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nested_directory_creation() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        put(&storage, "a/b/c/d/e/file", b"deep").await.unwrap();
+        let data = get(&storage, "a/b/c/d/e/file").await.unwrap();
+        assert_eq!(&*data, b"deep");
+    }
+
+    #[tokio::test]
+    async fn test_overwrite() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        put(&storage, "key", b"original").await.unwrap();
+        put(&storage, "key", b"updated").await.unwrap();
+
+        let data = get(&storage, "key").await.unwrap();
+        assert_eq!(&*data, b"updated");
+    }
+
+    #[test]
+    fn test_backend_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        assert_eq!(storage.backend_name(), "local");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_writes_same_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(temp_dir.path().to_str().unwrap()));
+
+        let mut handles = Vec::new();
+        for i in 0..10u8 {
+            let s = storage.clone();
+            handles.push(tokio::spawn(async move {
+                let data = vec![i; 1024];
+                put(&s, "shared/key", &data).await
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task panicked").expect("put failed");
+        }
+
+        let data = get(&storage, "shared/key").await.expect("get failed");
+        assert_eq!(data.len(), 1024);
+        let first = data[0];
+        assert!(
+            data.iter().all(|&b| b == first),
+            "file is corrupted — mixed writers"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_writes_different_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(temp_dir.path().to_str().unwrap()));
+
+        let mut handles = Vec::new();
+        for i in 0..10u32 {
+            let s = storage.clone();
+            handles.push(tokio::spawn(async move {
+                let key = format!("key/{}", i);
+                put(&s, &key, format!("data-{}", i).as_bytes()).await
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task panicked").expect("put failed");
+        }
+
+        for i in 0..10u32 {
+            let key = format!("key/{}", i);
+            let data = get(&storage, &key).await.expect("get failed");
+            assert_eq!(&*data, format!("data-{}", i).as_bytes());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_read_during_write() {
+        // The put path writes a temp file, fsyncs it, and atomically renames it
+        // into place, so a concurrent reader observes either the complete old
+        // object or the complete new one — never a torn mix of both, never a
+        // partial length, and never a missing key (the destination always
+        // resolves to one inode or the other). This asserts that invariant under
+        // contention: a non-atomic write (write-in-place, or unlink-then-write)
+        // would expose a torn read or a NotFound here and fail.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const LEN: usize = 1 << 16; // 64 KiB — wide enough that a non-atomic write tears
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(temp_dir.path().to_str().unwrap()));
+        put(&storage, "rw/key", &vec![0u8; LEN])
+            .await
+            .expect("seed put");
+
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+
+        let sw = storage.clone();
+        let dw = done.clone();
+        let writer = tokio::spawn(async move {
+            // Alternate all-0x00 and all-0x01 payloads so any torn read is a
+            // visible mix of the two.
+            for i in 0..100u32 {
+                let byte = if i % 2 == 0 { 0u8 } else { 1u8 };
+                put(&sw, "rw/key", &vec![byte; LEN])
+                    .await
+                    .expect("put failed");
+            }
+            dw.store(true, Ordering::Release);
+        });
+
+        let sr = storage.clone();
+        let dr = done.clone();
+        let reader = tokio::spawn(async move {
+            // Spin for the whole write loop so the concurrent window is exercised.
+            while !dr.load(Ordering::Acquire) {
+                match get(&sr, "rw/key").await {
+                    Ok(data) => {
+                        assert_eq!(data.len(), LEN, "torn/partial read: wrong object length");
+                        let first = data[0];
+                        assert!(
+                            data.iter().all(|&b| b == first),
+                            "torn read: object mixes old (0x00) and new (0x01) bytes — atomic rename violated"
+                        );
+                    }
+                    Err(crate::storage::StorageError::NotFound) => {
+                        panic!(
+                            "key vanished mid-write — atomic rename violated (unlink-then-write?)"
+                        )
+                    }
+                    Err(e) => panic!("unexpected error: {}", e),
+                }
+            }
+        });
+
+        writer.await.expect("writer panicked");
+        reader.await.expect("reader panicked");
+
+        // Final state is a complete, uniform object.
+        let data = get(&storage, "rw/key").await.expect("final get");
+        assert_eq!(data.len(), LEN);
+        let first = data[0];
+        assert!(
+            data.iter().all(|&b| b == first),
+            "final state must be a uniform object"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_total_size_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        assert_eq!(storage.total_size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_total_size_with_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        put(&storage, "a/file1", b"hello").await.unwrap(); // 5 bytes
+        put(&storage, "b/file2", b"world!").await.unwrap(); // 6 bytes
+
+        let size = storage.total_size().await;
+        assert_eq!(size, 11);
+    }
+
+    #[tokio::test]
+    async fn test_total_size_after_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+
+        put(&storage, "file1", b"12345").await.unwrap();
+        put(&storage, "file2", b"67890").await.unwrap();
+        assert_eq!(storage.total_size().await, 10);
+
+        storage.delete("file1").await.unwrap();
+        assert_eq!(storage.total_size().await, 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_deletes_same_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(temp_dir.path().to_str().unwrap()));
+
+        put(&storage, "del/key", b"ephemeral").await.expect("put");
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let s = storage.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = s.delete("del/key").await;
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task panicked");
+        }
+
+        assert!(matches!(
+            get(&storage, "del/key").await,
+            Err(crate::storage::StorageError::NotFound)
+        ));
+    }
+}

@@ -1,0 +1,1186 @@
+// Copyright (c) 2026 The NORA Authors
+// SPDX-License-Identifier: MIT
+
+pub(crate) mod api;
+pub mod components;
+pub mod i18n;
+
+mod static_assets;
+mod templates;
+
+use crate::repo_index::paginate;
+use crate::tokens::Role;
+use crate::AppState;
+use axum::{
+    body::Body,
+    extract::{Path, Query, Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::Next,
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{get, post},
+    Extension, Form, Router,
+};
+
+use crate::auth::{AuthenticatedRole, AuthenticatedUser};
+use api::*;
+use i18n::Lang;
+use templates::*;
+
+/// Returns base URL for UI install commands.
+///
+/// Thin wrapper over [`ServerConfig::public_base_url`] — the single source of
+/// truth for client-facing URLs.
+fn resolve_base_url(state: &AppState) -> String {
+    state.config.server.public_base_url()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LangQuery {
+    lang: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DetailQuery {
+    lang: Option<String>,
+    prerelease: Option<bool>,
+    all: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ListQuery {
+    lang: Option<String>,
+    page: Option<usize>,
+    limit: Option<usize>,
+}
+
+const DEFAULT_PAGE_SIZE: usize = 50;
+
+fn extract_lang(query: &Query<LangQuery>, cookie_header: Option<&str>) -> Lang {
+    // Priority: query param > cookie > default
+    if let Some(ref lang) = query.lang {
+        return Lang::from_str(lang);
+    }
+
+    // Try cookie
+    if let Some(cookies) = cookie_header {
+        for part in cookies.split(';') {
+            let part = part.trim();
+            if let Some(value) = part.strip_prefix("nora_lang=") {
+                return Lang::from_str(value);
+            }
+        }
+    }
+
+    Lang::default()
+}
+
+fn extract_lang_from_list(query: &ListQuery, cookie_header: Option<&str>) -> Lang {
+    if let Some(ref lang) = query.lang {
+        return Lang::from_str(lang);
+    }
+
+    if let Some(cookies) = cookie_header {
+        for part in cookies.split(';') {
+            let part = part.trim();
+            if let Some(value) = part.strip_prefix("nora_lang=") {
+                return Lang::from_str(value);
+            }
+        }
+    }
+
+    Lang::default()
+}
+
+fn extract_lang_from_headers(headers: &axum::http::HeaderMap) -> Lang {
+    // Try cookie
+    if let Some(cookies) = headers.get("cookie").and_then(|v| v.to_str().ok()) {
+        for part in cookies.split(';') {
+            let part = part.trim();
+            if let Some(value) = part.strip_prefix("nora_lang=") {
+                return Lang::from_str(value);
+            }
+        }
+    }
+    Lang::default()
+}
+
+/// Extract username from Basic Auth header (already validated by auth middleware)
+fn extract_basic_auth_user(headers: &axum::http::HeaderMap) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let auth_header = headers.get("authorization")?.to_str().ok()?;
+    let encoded = auth_header.strip_prefix("Basic ")?;
+    let decoded = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
+    let (user, _) = decoded.split_once(':')?;
+    Some(user.to_string())
+}
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        // UI Pages
+        .route("/", get(|| async { Redirect::to("/ui/") }))
+        .route("/ui", get(|| async { Redirect::to("/ui/") }))
+        .route("/ui/", get(dashboard))
+        .route("/ui/docker", get(docker_list))
+        .route("/ui/docker/{name}", get(docker_detail))
+        .route("/ui/maven", get(maven_list))
+        .route("/ui/maven/{*path}", get(maven_detail))
+        .route("/ui/npm", get(npm_list))
+        .route("/ui/npm/{name}", get(npm_detail))
+        .route("/ui/cargo", get(cargo_list))
+        .route("/ui/cargo/{name}", get(cargo_detail))
+        .route("/ui/pypi", get(pypi_list))
+        .route("/ui/pypi/{name}", get(pypi_detail))
+        .route("/ui/go", get(go_list))
+        .route("/ui/go/{*name}", get(go_detail))
+        .route("/ui/raw", get(raw_list))
+        .route("/ui/raw/{*name}", get(raw_detail))
+        // New registries (v0.7 — generic list pages)
+        .route("/ui/gems", get(generic_registry_list))
+        .route("/ui/terraform", get(generic_registry_list))
+        .route("/ui/ansible", get(ansible_browse_root))
+        .route("/ui/ansible/{*path}", get(ansible_browse))
+        .route("/ui/nuget", get(generic_registry_list))
+        .route("/ui/nuget/{name}", get(generic_registry_detail))
+        .route("/ui/pub", get(generic_registry_list))
+        .route("/ui/pub/{name}", get(generic_registry_detail))
+        .route("/ui/conan", get(generic_registry_list))
+        .route("/ui/conan/{name}", get(generic_registry_detail))
+        .route("/ui/rpm", get(generic_registry_list))
+        .route("/ui/rpm/{name}", get(generic_registry_detail))
+        .route("/ui/deb", get(generic_registry_list))
+        .route("/ui/deb/{name}", get(generic_registry_detail))
+        .route("/ui/cpan", get(cpan_browse_root))
+        .route("/ui/cpan/{*path}", get(cpan_browse))
+        .route("/ui/gems/{name}", get(generic_registry_detail))
+        .route("/ui/terraform/{name}", get(generic_registry_detail))
+        // Token management UI (protected by auth middleware)
+        .route("/ui/tokens", get(tokens_page))
+        // Token management API (HTMX endpoints)
+        .route("/api/ui/tokens/create", post(tokens_create))
+        .route("/api/ui/tokens/list", get(tokens_list))
+        .route("/api/ui/tokens/{file_id}/revoke", post(tokens_revoke))
+        // Static assets (embedded)
+        .route(
+            "/ui/static/tailwind.css",
+            get(static_assets::serve_tailwind_css),
+        )
+        .route("/ui/static/htmx.min.js", get(static_assets::serve_htmx_js))
+        // API endpoints for HTMX
+        .route("/api/ui/stats", get(api_stats))
+        .route("/api/ui/dashboard", get(api_dashboard))
+        .route("/api/ui/{registry_type}/list", get(api_list))
+        .route("/api/ui/{registry_type}/{name}", get(api_detail))
+        .route("/api/ui/{registry_type}/search", get(api_search))
+}
+
+/// Prefix NORA's root-absolute UI self-links with `base` so the UI works when
+/// NORA is mounted under a sub-path. Anchored on the quote that opens an HTML
+/// attribute or JS string, so only emitted links (`href`/`src`/`hx-*`/`fetch(`)
+/// are rewritten — never a link-like substring in page text. No-op when empty.
+fn apply_base_path(html: &str, base: &str) -> String {
+    if base.is_empty() {
+        return html.to_string();
+    }
+    html.replace("\"/ui", &format!("\"{base}/ui"))
+        .replace("'/ui", &format!("'{base}/ui"))
+        .replace("\"/api/ui", &format!("\"{base}/api/ui"))
+        .replace("'/api/ui", &format!("'{base}/api/ui"))
+        // The API-docs (Swagger UI) entry link in the nav and the root-absolute
+        // spec URL the Swagger initializer embeds ("/api-docs/openapi.json").
+        .replace("\"/api-docs", &format!("\"{base}/api-docs"))
+        .replace("'/api-docs", &format!("'{base}/api-docs"))
+}
+
+/// Response middleware: rewrite the UI's root-absolute self-links to carry the
+/// configured `public_url` path prefix. Covers HTML bodies (links + inline JS
+/// `fetch`), the Swagger UI initializer's spec URL, and redirect `Location`
+/// headers. A no-op when `base_path` is empty (the router keeps serving `/ui`,
+/// `/api/ui` and `/api-docs`; the proxy strips the prefix).
+pub(crate) async fn rewrite_ui_base_path(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let base = state.config.server.base_path();
+    // Capture the path before the request is consumed: the Swagger initializer
+    // is served as JS (not HTML) yet embeds a root-absolute spec URL that needs
+    // the same prefix, so it is rewritten by path rather than by content type.
+    let path = req.uri().path().to_string();
+    let mut resp = next.run(req).await;
+    if base.is_empty() {
+        return resp;
+    }
+    // A redirect target (e.g. "/" -> "/ui/", "/api-docs" -> "/api-docs/") must
+    // carry the prefix too.
+    if let Some(loc) = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if (loc.starts_with("/ui") || loc.starts_with("/api/ui") || loc.starts_with("/api-docs"))
+            && !loc.starts_with(&base)
+        {
+            if let Ok(hv) = HeaderValue::from_str(&format!("{base}{loc}")) {
+                resp.headers_mut().insert(header::LOCATION, hv);
+            }
+        }
+    }
+    let is_html = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|c| c.contains("text/html"));
+    // The Swagger UI initializer is JS but embeds a root-absolute spec URL
+    // ("/api-docs/openapi.json"); rewrite it too so the docs load under a
+    // sub-path. Scoped to that one small file — large JS bundles pass through.
+    let is_swagger_init = path.ends_with("/swagger-initializer.js");
+    if !is_html && !is_swagger_init {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let rewritten = apply_base_path(&String::from_utf8_lossy(&bytes), &base);
+    // The body length changed; drop the stale Content-Length so it is recomputed.
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(rewritten))
+}
+
+// Dashboard page
+async fn dashboard(
+    State(state): State<AppState>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+    user: Option<Extension<AuthenticatedUser>>,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let auth_enabled = state.auth.is_some();
+    let authenticated = user.map(|Extension(u)| u.0 != "anonymous").unwrap_or(false);
+    let response = build_dashboard_response(&state, authenticated).await;
+    Html(render_dashboard(&response, lang, auth_enabled))
+}
+
+// Docker pages
+async fn docker_list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
+
+    let all_repos = state.repo_index.get("docker", &state.storage).await;
+    let (repos, total) = paginate(&all_repos, page, limit);
+
+    Html(render_registry_list_paginated(
+        "docker",
+        "Docker Registry",
+        &repos,
+        page,
+        limit,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn docker_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
+    let detail = get_docker_detail(&state, &name).await;
+    Html(render_docker_detail(
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
+    ))
+}
+
+// Maven pages
+async fn maven_list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let auth_enabled = state.auth.is_some();
+
+    // Show top-level namespace directories (com, org, io, etc.)
+    let (entries, _) = api::get_maven_dir_listing(&state.storage, "").await;
+    let total = entries.len();
+
+    Html(templates::render_maven_dir(
+        "",
+        &entries,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn maven_detail(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let auth_enabled = state.auth.is_some();
+
+    // Try hierarchical browsing: check if this is a directory or leaf artifact
+    let (entries, is_leaf) = api::get_maven_dir_listing(&state.storage, &path).await;
+
+    if is_leaf || entries.is_empty() {
+        // Leaf artifact — show files (JARs, POMs, etc.)
+        let detail = get_maven_detail(&state.storage, &path).await;
+        Html(render_maven_detail(&path, &detail, lang, auth_enabled))
+    } else {
+        // Namespace directory — show children
+        let total = entries.len();
+        Html(templates::render_maven_dir(
+            &path,
+            &entries,
+            total,
+            lang,
+            auth_enabled,
+        ))
+    }
+}
+
+// npm pages
+async fn npm_list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
+
+    let all_packages = state.repo_index.get("npm", &state.storage).await;
+    let (packages, total) = paginate(&all_packages, page, limit);
+
+    Html(render_registry_list_paginated(
+        "npm",
+        "npm Registry",
+        &packages,
+        page,
+        limit,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn npm_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<DetailQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
+    let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
+    let show_prerelease = query.prerelease.unwrap_or(false);
+    let show_all = query.all.unwrap_or(false);
+    let detail = get_npm_detail(&state.storage, &name, show_prerelease, show_all).await;
+    Html(render_package_detail(
+        "npm",
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
+    ))
+}
+
+// Cargo pages
+async fn cargo_list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
+
+    let all_crates = state.repo_index.get("cargo", &state.storage).await;
+    let (crates, total) = paginate(&all_crates, page, limit);
+
+    Html(render_registry_list_paginated(
+        "cargo",
+        "Cargo Registry",
+        &crates,
+        page,
+        limit,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn cargo_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<DetailQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
+    let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
+    let show_prerelease = query.prerelease.unwrap_or(false);
+    let show_all = query.all.unwrap_or(false);
+    let detail = get_cargo_detail(&state.storage, &name, show_prerelease, show_all).await;
+    Html(render_package_detail(
+        "cargo",
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
+    ))
+}
+
+// PyPI pages
+async fn pypi_list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
+
+    let all_packages = state.repo_index.get("pypi", &state.storage).await;
+    let (packages, total) = paginate(&all_packages, page, limit);
+
+    Html(render_registry_list_paginated(
+        "pypi",
+        "PyPI Repository",
+        &packages,
+        page,
+        limit,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn pypi_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<DetailQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
+    let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
+    let show_prerelease = query.prerelease.unwrap_or(false);
+    let show_all = query.all.unwrap_or(false);
+    let detail = get_pypi_detail(&state.storage, &name, show_prerelease, show_all).await;
+    Html(render_package_detail(
+        "pypi",
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
+    ))
+}
+
+// Go pages
+async fn go_list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let auth_enabled = state.auth.is_some();
+
+    // Show top-level namespace directories (github.com, golang.org, etc.)
+    let (entries, _) = api::get_go_dir_listing(&state.storage, "").await;
+    let total = entries.len();
+
+    Html(templates::render_go_dir(
+        "",
+        &entries,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn go_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<DetailQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
+    let auth_enabled = state.auth.is_some();
+
+    // Try hierarchical browsing: check if this is a directory or leaf module
+    let (entries, is_leaf) = api::get_go_dir_listing(&state.storage, &name).await;
+
+    if is_leaf || entries.is_empty() {
+        // Leaf module — show version detail page
+        let base_url = resolve_base_url(&state);
+        let show_prerelease = query.prerelease.unwrap_or(false);
+        let show_all = query.all.unwrap_or(false);
+        let detail = get_go_detail(&state.storage, &name, show_prerelease, show_all).await;
+        Html(render_package_detail(
+            "go",
+            &name,
+            &detail,
+            lang,
+            &base_url,
+            auth_enabled,
+        ))
+    } else {
+        // Namespace directory — show children
+        let total = entries.len();
+        Html(templates::render_go_dir(
+            &name,
+            &entries,
+            total,
+            lang,
+            auth_enabled,
+        ))
+    }
+}
+
+// Raw pages
+async fn raw_list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
+
+    let all_files = state.repo_index.get("raw", &state.storage).await;
+    let (files, total) = paginate(&all_files, page, limit);
+
+    Html(render_registry_list_paginated(
+        "raw",
+        "Raw Storage",
+        &files,
+        page,
+        limit,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn raw_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
+
+    // Check if this path is a directory (has children) or a single file
+    let (entries, is_dir) = api::get_raw_dir_listing(&state.storage, &name).await;
+
+    if is_dir && !entries.is_empty() {
+        // Directory with children — render as browsable folder listing
+        let total = entries.len();
+        Html(templates::render_raw_dir(
+            &name,
+            &entries,
+            total,
+            lang,
+            auth_enabled,
+        ))
+    } else {
+        // Single file or leaf directory — render detail page
+        let detail = api::get_raw_detail(&state.storage, &name).await;
+        Html(templates::render_package_detail(
+            "raw",
+            &name,
+            &detail,
+            lang,
+            &base_url,
+            auth_enabled,
+        ))
+    }
+}
+
+// Generic registry list handler for new formats (v0.7)
+async fn generic_registry_list(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_list(&query, headers.get("cookie").and_then(|v| v.to_str().ok()));
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(100);
+    let auth_enabled = state.auth.is_some();
+
+    // Extract registry type from URI path: /ui/{type}
+    let registry_key = uri.path().strip_prefix("/ui/").unwrap_or("raw");
+    let title = match crate::registry_type::RegistryType::from_str_opt(registry_key) {
+        Some(crate::registry_type::RegistryType::Gems) => "RubyGems",
+        Some(crate::registry_type::RegistryType::Terraform) => "Terraform Registry",
+        Some(crate::registry_type::RegistryType::Ansible) => "Ansible Galaxy",
+        Some(crate::registry_type::RegistryType::Nuget) => "NuGet Gallery",
+        Some(crate::registry_type::RegistryType::PubDart) => "Pub (Dart/Flutter)",
+        Some(crate::registry_type::RegistryType::Conan) => "Conan (C/C++)",
+        Some(crate::registry_type::RegistryType::Rpm) => "RPM (yum/dnf)",
+        Some(crate::registry_type::RegistryType::Deb) => "Debian (APT)",
+        Some(crate::registry_type::RegistryType::Cpan) => "CPAN",
+        _ => registry_key,
+    };
+
+    let all_items = state.repo_index.get(registry_key, &state.storage).await;
+    let (items, total) = paginate(&all_items, page, limit);
+
+    Html(render_registry_list_paginated(
+        registry_key,
+        title,
+        &items,
+        page,
+        limit,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn generic_registry_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<DetailQuery>,
+    headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
+) -> impl IntoResponse {
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
+    let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
+    let show_prerelease = query.prerelease.unwrap_or(false);
+    let show_all = query.all.unwrap_or(false);
+
+    // Extract registry type from URI: /ui/{type}/{name}
+    let registry_key = uri
+        .path()
+        .strip_prefix("/ui/")
+        .and_then(|s| s.split('/').next())
+        .unwrap_or("raw");
+
+    let detail = get_generic_detail(
+        &state.storage,
+        registry_key,
+        &name,
+        show_prerelease,
+        show_all,
+    )
+    .await;
+    Html(render_package_detail(
+        registry_key,
+        &name,
+        &detail,
+        lang,
+        &base_url,
+        auth_enabled,
+    ))
+}
+
+// CPAN hierarchical browsing (author prefix → author → distribution)
+async fn cpan_browse_root(
+    State(state): State<AppState>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let auth_enabled = state.auth.is_some();
+
+    let entries = api::get_cpan_dir_listing(&state.storage, "").await;
+    let total = entries.len();
+
+    Html(templates::render_cpan_dir(
+        "",
+        &entries,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn cpan_browse(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(query): Query<DetailQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
+    let auth_enabled = state.auth.is_some();
+
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    match segments.len() {
+        // /ui/cpan/L or /ui/cpan/LC or /ui/cpan/LCONS → list directory contents
+        0..=3 => {
+            let entries = api::get_cpan_dir_listing(&state.storage, &path).await;
+            let total = entries.len();
+            Html(templates::render_cpan_dir(
+                &path,
+                &entries,
+                total,
+                lang,
+                auth_enabled,
+            ))
+            .into_response()
+        }
+        // Preserve old file-shaped links, but make the distribution URL
+        // canonical so all cached releases share one detail page.
+        _ => {
+            let filename = path.rsplit('/').next().unwrap_or(&path);
+            if let Some((distribution, _)) =
+                crate::registry::cpan::parse_dist_archive_filename(filename)
+            {
+                let author_path = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                let encoded_author_path = author_path
+                    .split('/')
+                    .map(templates::encode_uri_component)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let location = format!(
+                    "/ui/cpan/{}/{}",
+                    encoded_author_path,
+                    templates::encode_uri_component(distribution)
+                );
+                return Redirect::permanent(&location).into_response();
+            }
+
+            let base_url = resolve_base_url(&state);
+            let show_prerelease = query.prerelease.unwrap_or(false);
+            let show_all = query.all.unwrap_or(false);
+            let detail =
+                api::get_cpan_detail(&state.storage, &path, show_prerelease, show_all).await;
+            Html(templates::render_package_detail(
+                "cpan",
+                &path,
+                &detail,
+                lang,
+                &base_url,
+                auth_enabled,
+            ))
+            .into_response()
+        }
+    }
+}
+
+// Ansible Galaxy hierarchical browsing (namespace → collection → versions)
+async fn ansible_browse_root(
+    State(state): State<AppState>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let auth_enabled = state.auth.is_some();
+
+    let entries = api::get_ansible_namespace_listing(&state.storage, "").await;
+    let total = entries.len();
+
+    Html(templates::render_ansible_dir(
+        "",
+        &entries,
+        total,
+        lang,
+        auth_enabled,
+    ))
+}
+
+async fn ansible_browse(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    Query(query): Query<DetailQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = {
+        let lang_q = LangQuery {
+            lang: query.lang.clone(),
+        };
+        extract_lang(
+            &Query(lang_q),
+            headers.get("cookie").and_then(|v| v.to_str().ok()),
+        )
+    };
+    let auth_enabled = state.auth.is_some();
+
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    match segments.len() {
+        // /ui/ansible/community → list collections in namespace
+        1 => {
+            let entries = api::get_ansible_namespace_listing(&state.storage, &path).await;
+            let total = entries.len();
+            Html(templates::render_ansible_dir(
+                &path,
+                &entries,
+                total,
+                lang,
+                auth_enabled,
+            ))
+        }
+        // /ui/ansible/community/general → version detail
+        2 => {
+            let base_url = resolve_base_url(&state);
+            let show_prerelease = query.prerelease.unwrap_or(false);
+            let show_all = query.all.unwrap_or(false);
+            let full_name = format!("{}.{}", segments[0], segments[1]);
+            let detail = get_generic_detail(
+                &state.storage,
+                "ansible",
+                &full_name,
+                show_prerelease,
+                show_all,
+            )
+            .await;
+            Html(render_package_detail(
+                "ansible",
+                &full_name,
+                &detail,
+                lang,
+                &base_url,
+                auth_enabled,
+            ))
+        }
+        // Deeper paths: 404
+        _ => Html(templates::render_ansible_dir(
+            &path,
+            &[],
+            0,
+            lang,
+            auth_enabled,
+        )),
+    }
+}
+
+// ==================== Token Management Handlers ====================
+
+/// Token management page (GET /ui/tokens)
+async fn tokens_page(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Extension(role): Extension<AuthenticatedRole>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_headers(&headers);
+
+    // Owner-scope: non-admins see only their own tokens; admins see all
+    // (GHSA-78cx-cfhm-rgmx — cross-user token enumeration).
+    let tokens = match &state.tokens {
+        Some(store) if role.0.can_admin() => store.list_all_tokens(),
+        Some(store) => store.list_tokens(&user.0),
+        None => vec![],
+    };
+
+    Html(render_tokens_page(&tokens, lang, true))
+}
+
+/// Create token (POST /api/ui/tokens/create)
+#[derive(serde::Deserialize)]
+struct CreateTokenForm {
+    description: String,
+    role: String,
+    ttl_days: Option<u64>,
+}
+
+async fn tokens_create(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<CreateTokenForm>,
+) -> impl IntoResponse {
+    // CSRF check: require HX-Request header (HTMX sets this automatically)
+    if headers.get("hx-request").is_none() {
+        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string()));
+    }
+
+    let lang = extract_lang_from_headers(&headers);
+
+    let store = match &state.tokens {
+        Some(store) => store,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("Token store not configured".to_string()),
+            );
+        }
+    };
+
+    // Get authenticated user from Basic Auth header — token creation requires
+    // knowing who created it, so we reject requests without Basic auth identity.
+    let user = match extract_basic_auth_user(&headers) {
+        Some(u) => u,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(
+                    r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Token creation requires Basic authentication to identify the owner</div>"##.to_string(),
+                ),
+            );
+        }
+    };
+
+    let role = match form.role.as_str() {
+        "read" => Role::Read,
+        "write" => Role::Write,
+        "admin" => Role::Admin,
+        _ => Role::Read,
+    };
+
+    let ttl_days = form.ttl_days.unwrap_or(90).clamp(1, 3650);
+
+    let description = if form.description.trim().is_empty() {
+        None
+    } else {
+        Some(form.description.trim().to_string())
+    };
+
+    match store.create_token(&user, ttl_days, description, role) {
+        Ok(raw_token) => {
+            let html = render_token_created_fragment(&raw_token, lang);
+            (StatusCode::OK, Html(html))
+        }
+        Err(e) => {
+            let html = format!(
+                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Error: {}</div>"##,
+                components::html_escape(&e.to_string())
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Html(html))
+        }
+    }
+}
+
+/// List tokens HTMX fragment (GET /api/ui/tokens/list)
+async fn tokens_list(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Extension(role): Extension<AuthenticatedRole>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let lang = extract_lang_from_headers(&headers);
+
+    // Owner-scope: non-admins see only their own tokens; admins see all
+    // (GHSA-78cx-cfhm-rgmx — cross-user token enumeration).
+    let tokens = match &state.tokens {
+        Some(store) if role.0.can_admin() => store.list_all_tokens(),
+        Some(store) => store.list_tokens(&user.0),
+        None => vec![],
+    };
+
+    Html(render_token_list_fragment(&tokens, lang))
+}
+
+/// Revoke token (POST /api/ui/tokens/{file_id}/revoke)
+async fn tokens_revoke(
+    State(state): State<AppState>,
+    Path(file_id): Path<String>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Extension(role): Extension<AuthenticatedRole>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // CSRF check
+    if headers.get("hx-request").is_none() {
+        return (StatusCode::FORBIDDEN, Html("Forbidden".to_string()));
+    }
+
+    // Validate file_id: must be exactly 16 hex chars (path traversal prevention)
+    if file_id.len() != 16 || !file_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("Invalid token ID".to_string()),
+        );
+    }
+
+    let lang = extract_lang_from_headers(&headers);
+
+    let store = match &state.tokens {
+        Some(store) => store,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html("Token store not configured".to_string()),
+            );
+        }
+    };
+
+    // Owner-scope: non-admins may revoke only their own tokens. Return 404 (not
+    // 403) so a non-owner cannot probe which token IDs exist
+    // (GHSA-78cx-cfhm-rgmx — cross-user token revocation).
+    let is_admin = role.0.can_admin();
+    if !is_admin
+        && !store
+            .list_tokens(&user.0)
+            .iter()
+            .any(|t| t.file_id == file_id)
+    {
+        return (StatusCode::NOT_FOUND, Html("Token not found".to_string()));
+    }
+
+    match store.revoke_token(&file_id) {
+        Ok(()) => {
+            // Return refreshed token list (same owner-scope as the list view)
+            let tokens = if is_admin {
+                store.list_all_tokens()
+            } else {
+                store.list_tokens(&user.0)
+            };
+            (
+                StatusCode::OK,
+                Html(render_token_list_fragment(&tokens, lang)),
+            )
+        }
+        Err(crate::tokens::TokenError::NotFound) => {
+            (StatusCode::NOT_FOUND, Html("Token not found".to_string()))
+        }
+        Err(e) => {
+            let html = format!(
+                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">Error: {}</div>"##,
+                components::html_escape(&e.to_string())
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Html(html))
+        }
+    }
+}
+
+#[cfg(test)]
+mod base_path_tests {
+    use super::*;
+
+    #[test]
+    fn apply_base_path_is_noop_when_empty() {
+        let html = r#"<a href="/ui/docker">d</a><script src="/ui/static/x.js"></script>"#;
+        assert_eq!(apply_base_path(html, ""), html);
+    }
+
+    #[test]
+    fn apply_base_path_prefixes_ui_and_api_links() {
+        let html = concat!(
+            r#"<link href="/ui/static/tailwind.css">"#,
+            r#"<a href="/ui/docker">d</a>"#,
+            r#"<script>fetch('/api/ui/dashboard')</script>"#,
+            r#"<form action="/api/ui/tokens/create">"#,
+        );
+        let out = apply_base_path(html, "/nora");
+        assert!(out.contains(r#"href="/nora/ui/static/tailwind.css""#));
+        assert!(out.contains(r#"href="/nora/ui/docker""#));
+        assert!(out.contains("fetch('/nora/api/ui/dashboard')"));
+        assert!(out.contains(r#"action="/nora/api/ui/tokens/create""#));
+        // No leftover bare links, no double-prefix.
+        assert!(!out.contains(r#"href="/ui/"#));
+        assert!(!out.contains("fetch('/api/ui"));
+        assert!(!out.contains("/nora/nora/"));
+    }
+
+    #[test]
+    fn apply_base_path_prefixes_api_docs_link_and_spec_url() {
+        // The "API Docs" nav link (HTML) and the Swagger initializer's embedded
+        // spec URL (JS) are both root-absolute /api-docs paths that break under a
+        // sub-path unless prefixed. Regression guard for the #686 residual.
+        let html = r#"<a href="/api-docs" title="API Docs">d</a>"#;
+        let init = r#"window.ui = SwaggerUIBundle({ "url": "/api-docs/openapi.json" });"#;
+        assert!(apply_base_path(html, "/nora").contains(r#"href="/nora/api-docs""#));
+        let out = apply_base_path(init, "/nora");
+        assert!(out.contains(r#""url": "/nora/api-docs/openapi.json""#));
+        assert!(!out.contains(r#""/api-docs/openapi.json""#));
+        // Empty base is still a no-op for the api-docs paths.
+        assert_eq!(apply_base_path(html, ""), html);
+    }
+
+    #[test]
+    fn apply_base_path_leaves_non_link_text_untouched() {
+        // A link-like substring not anchored on an attribute/JS quote (e.g. in
+        // body text) is not a self-link and must not be rewritten.
+        let html = r#"<p>the path /ui/docker is shown</p>"#;
+        assert_eq!(apply_base_path(html, "/nora"), html);
+    }
+}

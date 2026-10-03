@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1.4
+#
+# Multi-platform packaging from pre-built binaries.
+# No compilation — just COPY the right binary for the target arch.
+#
+# Usage:
+#   docker buildx build -f deploy/Dockerfile.release \
+#     --platform linux/amd64,linux/arm64 --push .
+#
+# Expects nora-linux-amd64 and nora-linux-arm64 in the build context.
+
+FROM alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d
+ARG TARGETARCH
+
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates \
+    && addgroup -S nora && adduser -S -G nora nora \
+    && mkdir -p /data && chown nora:nora /data
+
+COPY --chown=nora:nora nora-linux-${TARGETARCH} /usr/local/bin/nora
+RUN chmod +x /usr/local/bin/nora
+
+ENV RUST_LOG=info \
+    NORA_HOST=:: \
+    NORA_CONFIG_PATH=/etc/nora/config.toml
+
+# Config *values* ship as a FILE, not ENV: env has the highest precedence in
+# Config::load and would silently override a user-provided config.toml (#719).
+# Only NORA_HOST stays in ENV — binding must survive a bind-mounted (possibly
+# partial) config.toml so the container stays reachable (-e NORA_HOST to change).
+COPY --chown=nora:nora deploy/config.docker.toml /etc/nora/config.toml
+
+EXPOSE 4000
+VOLUME ["/data"]
+USER nora
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/usr/local/bin/nora", "healthcheck"]
+
+ENTRYPOINT ["/usr/local/bin/nora"]
+CMD ["serve"]

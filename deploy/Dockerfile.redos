@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.4
+# Binary is pre-built by CI (cargo build --release) and passed via context
+# Runtime: scratch — compatible with RED OS (FSTEC certified)
+# To switch to official base: replace FROM scratch with
+#   FROM registry.red-soft.ru/redos/redos:8
+#   RUN dnf install -y ca-certificates && dnf clean all
+
+FROM alpine:3.20@sha256:a4f4213abb84c497377b8544c81b3564f313746700372ec4fe84653e4fb03805 AS certs
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S -g 10001 nora && adduser -S -u 10001 -G nora nora
+
+FROM scratch
+
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=certs /etc/passwd /etc/passwd
+COPY --from=certs /etc/group /etc/group
+COPY nora /usr/local/bin/nora
+
+ENV RUST_LOG=info
+ENV NORA_HOST=0.0.0.0
+ENV NORA_PORT=4000
+ENV NORA_STORAGE_MODE=local
+ENV NORA_STORAGE_PATH=/data/storage
+ENV NORA_AUTH_TOKEN_STORAGE=/data/tokens
+
+EXPOSE 4000
+
+VOLUME ["/data"]
+
+USER nora
+
+ENTRYPOINT ["/usr/local/bin/nora"]
+CMD ["serve"]
