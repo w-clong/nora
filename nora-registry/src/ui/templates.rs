@@ -133,6 +133,8 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
     #[cfg(not(feature = "demo"))]
     let bragging_footer = String::new();
 
+    let uploader_html = render_uploader_panel();
+
     let content = format!(
         r##"
         <div class="mb-6">
@@ -147,6 +149,8 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
                 </div>
             </div>
         </div>
+
+        {}
 
         {}
 
@@ -166,6 +170,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
         t.uptime,
         uptime_str,
         global_stats,
+        uploader_html,
         registry_cards,
         mount_points,
         activity_log,
@@ -2316,3 +2321,148 @@ mod tests {
         );
     }
 }
+
+/// Quick-upload panel embedded in the dashboard (drag & drop → PUT to rpm/deb/raw).
+/// Uses inline styles only — NORA's Tailwind build only ships classes present in the
+/// stock templates, so utility classes cannot be relied upon here.
+pub fn render_uploader_panel() -> String {
+    r##"
+<div style="margin-bottom:24px;border:1px solid rgba(51,65,85,.6);border-radius:12px;background:rgba(30,41,59,.4);padding:20px">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+    <span style="font-size:14px;font-weight:600;color:#cbd5e1">快速上传</span>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <label style="font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:4px">仓库名
+        <input id="nu-repo" value="myrepo" spellcheck="false"
+          style="background:#0f172a;border:1px solid #334155;border-radius:6px;padding:4px 8px;font-size:12px;color:#e2e8f0;width:96px">
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#94a3b8;cursor:pointer;user-select:none">
+        <input type="checkbox" id="nu-auto" checked style="accent-color:#0ea5e9">自动路由
+      </label>
+    </div>
+  </div>
+  <div id="nu-tabs" style="display:flex;gap:8px;margin-bottom:12px">
+    <button type="button" data-t="rpm" class="nu-tab"
+      style="padding:6px 12px;border-radius:8px;border:1px solid rgba(14,165,233,.6);background:rgba(14,165,233,.1);color:#7dd3fc;font-size:12px;font-weight:600;cursor:pointer">RPM</button>
+    <button type="button" data-t="deb" class="nu-tab"
+      style="padding:6px 12px;border-radius:8px;border:1px solid #334155;color:#94a3b8;font-size:12px;cursor:pointer">DEB</button>
+    <button type="button" data-t="raw" class="nu-tab"
+      style="padding:6px 12px;border-radius:8px;border:1px solid #334155;color:#94a3b8;font-size:12px;cursor:pointer">RAW</button>
+    <span id="nu-hint" style="font-size:12px;color:#64748b;align-self:center;margin-left:4px"></span>
+  </div>
+  <div id="nu-dropzone"
+    style="border:2px dashed #334155;border-radius:8px;padding:32px;text-align:center;cursor:pointer;transition:border-color .15s, background .15s">
+    <div style="font-size:14px;color:#cbd5e1;margin-bottom:4px">把 <b style="color:#7dd3fc">rpm / deb / 任意文件</b> 拖到这里</div>
+    <div style="font-size:12px;color:#64748b;margin-bottom:12px">拖入文件夹保留目录结构 · 大文件流式上传</div>
+    <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+      <button type="button" id="nu-file"
+        style="padding:6px 12px;border-radius:8px;border:1px solid rgba(14,165,233,.6);background:rgba(14,165,233,.1);color:#7dd3fc;font-size:12px;font-weight:500;cursor:pointer">选择文件</button>
+      <button type="button" id="nu-dir"
+        style="padding:6px 12px;border-radius:8px;border:1px solid #334155;color:#cbd5e1;font-size:12px;font-weight:500;cursor:pointer">选择文件夹</button>
+    </div>
+    <input type="file" id="nu-input-file" multiple hidden>
+    <input type="file" id="nu-input-dir" multiple webkitdirectory hidden>
+  </div>
+  <div id="nu-tasks" style="margin-top:12px;display:flex;flex-direction:column;gap:6px"></div>
+</div>
+<script>
+(function () {
+  var target = "rpm", repo = "myrepo", auto = true;
+  var MAX_CONCURRENCY = 3, running = 0, tasks = [];
+  var el = function (id) { return document.getElementById(id); };
+  var dz = el("nu-dropzone"), list = el("nu-tasks");
+  var TAB = {
+    on: "padding:6px 12px;border-radius:8px;border:1px solid rgba(14,165,233,.6);background:rgba(14,165,233,.1);color:#7dd3fc;font-size:12px;font-weight:600;cursor:pointer",
+    off: "padding:6px 12px;border-radius:8px;border:1px solid #334155;color:#94a3b8;font-size:12px;cursor:pointer"
+  };
+  var hint = { rpm: "上传到本地 RPM 仓库，自动重建 repodata", deb: "上传到本地 DEB 仓库，自动重建 Packages 索引", raw: "通用文件仓库，任何文件" };
+  var route = function (name) {
+    if (!auto) return target;
+    var ext = name.split(".").pop().toLowerCase();
+    if (ext === "rpm") return "rpm";
+    if (ext === "deb") return "deb";
+    return "raw";
+  };
+  var setHint = function () { el("nu-hint").textContent = hint[target]; };
+  el("nu-tabs").addEventListener("click", function (e) {
+    var b = e.target.closest(".nu-tab"); if (!b) return;
+    document.querySelectorAll(".nu-tab").forEach(function (x) { x.style.cssText = TAB.off; });
+    b.style.cssText = TAB.on;
+    target = b.dataset.t; setHint();
+  });
+  el("nu-repo").addEventListener("change", function (e) { repo = e.target.value.trim() || "myrepo"; });
+  el("nu-auto").addEventListener("change", function (e) { auto = e.target.checked; });
+  var esc = function (s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); };
+  var fmt = function (n) {
+    if (!n) return "0 B";
+    var u = ["B", "KB", "MB", "GB"], i = 0;
+    while (n >= 1024 && i < 3) { n /= 1024; i++; }
+    return n.toFixed(i && n < 100 ? 1 : 0) + " " + u[i];
+  };
+  var render = function () {
+    if (!tasks.length) { list.innerHTML = ""; return; }
+    list.innerHTML = "";
+    tasks.forEach(function (t) {
+      var row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:12px;background:rgba(15,23,42,.6);border:1px solid rgba(51,65,85,.6);border-radius:8px;padding:8px 12px;font-size:12px";
+      var st = t.state === "done" ? "#34d399" : t.state === "fail" ? "#f87171" : t.state === "run" ? "#fbbf24" : "#64748b";
+      var stt = t.state === "done" ? "完成" : t.state === "fail" ? "失败" : t.state === "run" ? "上传中" : "排队";
+      var err = t.state === "fail" ? '<span style="color:#f87171;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(t.err) + '">' + esc(t.err) + "</span>" : "";
+      row.innerHTML =
+        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e2e8f0">' + esc(t.name) + "</span>" +
+        '<span style="color:#64748b">' + t.target.toUpperCase() + "</span>" +
+        '<span style="width:96px"><span style="display:block;height:6px;border-radius:3px;background:#1e293b;overflow:hidden"><span style="display:block;height:100%;background:#38bdf8;border-radius:3px;transition:width .2s;width:' + (t.pct || 0) + '%"></span></span></span>' +
+        '<span style="color:#64748b">' + fmt(t.size) + "</span>" +
+        '<span style="color:' + st + ';width:40px">' + stt + "</span>" +
+        err;
+      list.appendChild(row);
+    });
+  };
+  var upload = function (t) {
+    running++;
+    t.state = "run"; t.pct = 0; render();
+    var base = location.origin;
+    var path = target === "raw" ? "/raw/" + encodeURIComponent(t.name) : "/" + t.target + "/" + encodeURIComponent(repo) + "/" + encodeURIComponent(t.name);
+    var xhr = new XMLHttpRequest();
+    xhr.open("PUT", base + path);
+    xhr.upload.onprogress = function (e) { if (e.lengthComputable) { t.pct = Math.round(e.loaded / e.total * 100); render(); } };
+    xhr.onload = function () {
+      t.state = xhr.status >= 200 && xhr.status < 300 ? "done" : "fail";
+      if (t.state === "fail") t.err = "HTTP " + xhr.status;
+      t.pct = t.state === "done" ? 100 : t.pct;
+      running--; render(); pump();
+    };
+    xhr.onerror = function () { t.state = "fail"; t.err = "网络错误"; running--; render(); pump(); };
+    xhr.send(t.file);
+  };
+  var pump = function () {
+    var next = tasks.filter(function (t) { return t.state === "wait"; });
+    while (running < MAX_CONCURRENCY && next.length) {
+      var t = next.shift();
+      upload(t);
+    }
+  };
+  var addFiles = function (files) {
+    Array.prototype.forEach.call(files, function (f) {
+      tasks.push({ file: f, name: f.name, size: f.size, target: route(f.name), state: "wait", pct: 0, err: "" });
+    });
+    render(); pump();
+  };
+  ["dragenter", "dragover"].forEach(function (ev) {
+    dz.addEventListener(ev, function (e) { e.preventDefault(); dz.style.borderColor = "rgba(56,189,248,.6)"; dz.style.background = "rgba(14,165,233,.05)"; });
+  });
+  ["dragleave", "drop"].forEach(function (ev) {
+    dz.addEventListener(ev, function (e) { e.preventDefault(); dz.style.borderColor = "#334155"; dz.style.background = "transparent"; });
+  });
+  dz.addEventListener("drop", function (e) { if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) addFiles(e.dataTransfer.files); });
+  dz.addEventListener("click", function (e) { if (e.target.closest("button")) return; el("nu-input-file").click(); });
+  el("nu-file").addEventListener("click", function (e) { e.stopPropagation(); el("nu-input-file").click(); });
+  el("nu-dir").addEventListener("click", function (e) { e.stopPropagation(); el("nu-input-dir").click(); });
+  el("nu-input-file").addEventListener("change", function (e) { addFiles(e.target.files); e.target.value = ""; });
+  el("nu-input-dir").addEventListener("change", function (e) { addFiles(e.target.files); e.target.value = ""; });
+  setHint();
+})();
+</script>
+"##
+    .to_string()
+}
+//（注：内容由AI生成）
