@@ -1,0 +1,794 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions: read-all
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    name: Build & Push (amd64 + binaries)
+    runs-on: [self-hosted, nora]
+    outputs:
+      hash: ${{ steps.hash.outputs.hash }}
+      version: ${{ steps.sha.outputs.version }}
+      short: ${{ steps.sha.outputs.short }}
+      # Images are staged by digest here; merge-image smoke-tests and promotes them. Tag
+      # names only, without the image path: the runner drops a job output that contains
+      # a masked value, and the path contains the Docker Hub username.
+      amd64_digest: ${{ steps.build-amd64.outputs.digest }}
+      redos_digest: ${{ steps.build-redos.outputs.digest }}
+      redos_tags: ${{ steps.variant-tags.outputs.redos }}
+      astra_digest: ${{ steps.build-astra.outputs.digest }}
+      astra_tags: ${{ steps.variant-tags.outputs.astra }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # Sigstore cosign keyless signing
+
+    steps:
+      - name: Clean up Docker resources
+        run: |
+          docker system prune -af --volumes || true
+          echo "Disk after cleanup: $(df -h / | tail -1 | awk '{print $4 " free"}')"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Get short SHA and version
+        id: sha
+        run: |
+          echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "Tag version:   ${TAG_VERSION}"
+          echo "Cargo version: ${CARGO_VERSION}"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Version mismatch! Tag ${GITHUB_REF_NAME} but Cargo.toml has ${CARGO_VERSION}. Bump version before tagging."
+            exit 1
+          fi
+
+      # No QEMU: the arm64 binary is cross-compiled (rust on amd64), and the arm64
+      # image is built natively on ubuntu-24.04-arm (see build-image-arm64). Emulated
+      # arm64 apk on the self-hosted runner crashes ("Illegal instruction") — #ci.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+        with:
+          driver-opts: network=host
+
+      - name: Extract binary from multi-stage build (amd64)
+        run: |
+          docker buildx build --platform linux/amd64 --target binary --output type=local,dest=./dist-amd64 .
+          cp ./dist-amd64/nora ./nora
+          cp ./dist-amd64/nora ./nora-linux-amd64
+          chmod +x ./nora-linux-amd64
+          echo "Binary size (amd64): $(du -sh nora-linux-amd64 | cut -f1)"
+          file ./nora-linux-amd64
+
+      - name: Cross-compile binary (arm64)
+        run: |
+          docker buildx build --platform linux/amd64 --target binary-arm64 \
+            --output type=local,dest=./dist-arm64 .
+          cp ./dist-arm64/nora ./nora-linux-arm64
+          chmod +x ./nora-linux-arm64
+          echo "Binary size (arm64): $(du -sh nora-linux-arm64 | cut -f1)"
+          file ./nora-linux-arm64
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nora-binary-${{ github.run_id }}
+          path: |
+            ./nora
+            ./nora-linux-arm64
+          retention-days: 1
+
+      - name: Compute binary hash for SLSA provenance
+        id: hash
+        run: |
+          sha256sum nora-linux-amd64 nora-linux-arm64 | base64 -w0 > hash.txt
+          echo "hash=$(cat hash.txt)" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ── Every image in this job is pushed BY DIGEST (no tag). Public tags move only in
+      #    merge-image, after every release gate has passed (#992). The alpine manifest
+      #    list is assembled there from the amd64 + arm64 (native runner) digests. ────
+      - name: Build and push alpine (amd64, by digest)
+        id: build-amd64
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          file: deploy/Dockerfile.release
+          platforms: linux/amd64
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export amd64 digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build-amd64.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload amd64 digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: digest-amd64-${{ github.run_id }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
+
+      # ── RED OS (amd64 only) — GHCR tags computed here, promoted in merge-image ────
+      - name: Extract metadata (redos)
+        id: meta-redos
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: suffix=-redos,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.sha.outputs.version }}-${{ steps.sha.outputs.short }}
+            type=raw,value=latest
+
+      - name: Build and push (redos, by digest)
+        id: build-redos
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          target: redos
+          platforms: linux/amd64
+          labels: ${{ steps.meta-redos.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      # ── Astra Linux SE (amd64 only) — GHCR tags computed here, promoted in merge-image
+      - name: Extract metadata (astra)
+        id: meta-astra
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: suffix=-astra,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.sha.outputs.version }}-${{ steps.sha.outputs.short }}
+            type=raw,value=latest
+
+      - name: Build and push (astra, by digest)
+        id: build-astra
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          target: astra
+          platforms: linux/amd64
+          labels: ${{ steps.meta-astra.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export RED OS + Astra tag names
+        id: variant-tags
+        env:
+          REDOS_TAGS: ${{ steps.meta-redos.outputs.tags }}
+          ASTRA_TAGS: ${{ steps.meta-astra.outputs.tags }}
+        run: |
+          set -euo pipefail
+          names() { local t; for t in $1; do printf '%s ' "${t##*:}"; done; }
+          {
+            echo "redos=$(names "$REDOS_TAGS")"
+            echo "astra=$(names "$ASTRA_TAGS")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Clean up Docker resources
+        if: always()
+        run: |
+          docker system prune -af --volumes || true
+          echo "Disk after cleanup: $(df -h / | tail -1 | awk '{print $4 " free"}')"
+
+  # ── Alpine arm64 — built NATIVELY on a GitHub-hosted arm64 runner (no QEMU). ───
+  # deploy/Dockerfile.release COPYs the pre-built nora-linux-${TARGETARCH}, so this
+  # job pulls the cross-compiled arm64 binary from the build job's artifact into the
+  # context (needs: build). apk now runs natively on arm64 — no emulation, no crash.
+  build-image-arm64:
+    name: Build alpine image (arm64, native)
+    runs-on: ubuntu-24.04-arm
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Download cross-compiled binaries into the build context
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nora-binary-${{ github.run_id }}
+          path: .
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push alpine (arm64, by digest)
+        id: build-arm64
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          file: deploy/Dockerfile.release
+          platforms: linux/arm64
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export arm64 digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build-arm64.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload arm64 digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: digest-arm64-${{ github.run_id }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
+
+  # ── Promote public tags — the only job that moves one (#992). It waits for every
+  #    release gate (arm64 image, deb/rpm packages, SLSA provenance), so a failure
+  #    upstream leaves alpine, RED OS and Astra on the last complete release. Every
+  #    variant is smoke-tested from its digest before a tag moves; re-running this
+  #    job re-points the same digests. ────────────────────────────────────────────
+  merge-image:
+    name: Promote images (alpine + RED OS + Astra) + sign + smoke
+    runs-on: [self-hosted, nora]
+    needs: [build, build-image-arm64, package, provenance]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # cosign keyless
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+        with:
+          driver-opts: network=host
+
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digest-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3
+
+      # Nothing is public yet: each variant runs from its staged digest. The runner is
+      # amd64, so alpine is exercised through its amd64 digest here; the assembled
+      # multi-arch tag is started again after promotion.
+      - name: Smoke test — every variant starts and responds (by digest)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          AMD64_DIGEST: ${{ needs.build.outputs.amd64_digest }}
+          REDOS_DIGEST: ${{ needs.build.outputs.redos_digest }}
+          ASTRA_DIGEST: ${{ needs.build.outputs.astra_digest }}
+        run: |
+          set -euo pipefail
+          trap 'docker rm -f nora-smoke-alpine nora-smoke-redos nora-smoke-astra >/dev/null 2>&1 || true' EXIT
+          for v in alpine redos astra; do
+            case "$v" in
+              alpine) ref="$IMAGE@$AMD64_DIGEST"; port=5555 ;;
+              redos)  ref="$IMAGE@$REDOS_DIGEST"; port=5556 ;;
+              astra)  ref="$IMAGE@$ASTRA_DIGEST"; port=5557 ;;
+            esac
+            echo "smoke $v: $ref"
+            docker rm -f "nora-smoke-$v" 2>/dev/null || true
+            docker run --rm -d --name "nora-smoke-$v" -p "$port:4000" -e NORA_HOST=0.0.0.0 -e "NORA_PUBLIC_URL=http://localhost:$port" "$ref"
+            for _ in $(seq 1 10); do
+              curl -sf "http://localhost:$port/health" >/dev/null && break
+              sleep 2
+            done
+            curl -sf "http://localhost:$port/health"
+            docker stop "nora-smoke-$v"
+          done
+
+      - name: Sign RED OS + Astra by digest (keyless Sigstore)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          REDOS_DIGEST: ${{ needs.build.outputs.redos_digest }}
+          ASTRA_DIGEST: ${{ needs.build.outputs.astra_digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE@$REDOS_DIGEST"
+          cosign sign --yes "$IMAGE@$ASTRA_DIGEST"
+
+      # GHCR-only tags (the arch images were pushed by-digest to GHCR). Docker Hub
+      # tags are produced by copying the assembled multi-arch GHCR manifest below.
+      - name: Extract metadata (alpine, GHCR)
+        id: meta-alpine
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.build.outputs.version }}-${{ needs.build.outputs.short }}
+            type=raw,value=latest
+
+      - name: Create multi-arch manifest in GHCR, then copy to Docker Hub
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          # 1) assemble the amd64+arm64 by-digest images into one manifest list per GHCR tag
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          # 2) copy each multi-arch GHCR tag to the matching Docker Hub tag
+          for t in $(jq -cr '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON"); do
+            dh="docker.io/getnora/nora:${t##*:}"
+            echo "copy $t -> $dh"
+            docker buildx imagetools create -t "$dh" "$t"
+          done
+
+      # RED OS / Astra: point each tag name exported by build at the staged digest in GHCR,
+      # copy it to Docker Hub, and check both refs resolve to that digest. The staged image
+      # is an index (image + attestation), which imagetools copies unchanged;
+      # --prefer-index=false keeps the digest for a bare manifest too.
+      - name: Promote RED OS + Astra tags in GHCR, then copy to Docker Hub
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DOCKERHUB_IMAGE: docker.io/getnora/nora
+          REDOS_DIGEST: ${{ needs.build.outputs.redos_digest }}
+          REDOS_TAGS: ${{ needs.build.outputs.redos_tags }}
+          ASTRA_DIGEST: ${{ needs.build.outputs.astra_digest }}
+          ASTRA_TAGS: ${{ needs.build.outputs.astra_tags }}
+        run: |
+          set -euo pipefail
+          promote() {
+            local digest="$1" names="$2" n ref got
+            if [ -z "$digest" ] || [ -z "${names// /}" ]; then
+              echo "::error::nothing staged to promote (digest='$digest', tags='$names')"
+              return 1
+            fi
+            for n in $names; do
+              echo "promote $IMAGE@$digest -> $IMAGE:$n, $DOCKERHUB_IMAGE:$n"
+              docker buildx imagetools create --prefer-index=false -t "$IMAGE:$n" "$IMAGE@$digest"
+              docker buildx imagetools create --prefer-index=false -t "$DOCKERHUB_IMAGE:$n" "$IMAGE:$n"
+              for ref in "$IMAGE:$n" "$DOCKERHUB_IMAGE:$n"; do
+                got=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -r .digest)
+                if [ "$got" != "$digest" ]; then
+                  echo "::error::$ref resolves to $got, staged $digest"
+                  return 1
+                fi
+              done
+            done
+          }
+          promote "$REDOS_DIGEST" "$REDOS_TAGS"
+          promote "$ASTRA_DIGEST" "$ASTRA_TAGS"
+
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}"
+          docker buildx imagetools inspect "docker.io/getnora/nora:${{ needs.build.outputs.version }}"
+
+      # The alpine manifest list is assembled from two digests during promotion, so it is
+      # checked afterwards: each Docker Hub tag must resolve to its GHCR tag's digest, and
+      # the promoted version tag must start and respond.
+      - name: Verify promoted alpine tags + smoke test the multi-arch tag
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DOCKERHUB_IMAGE: docker.io/getnora/nora
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          while read -r t; do
+            dh="$DOCKERHUB_IMAGE:${t##*:}"
+            want=$(docker buildx imagetools inspect "$t" --format '{{json .Manifest}}' | jq -r .digest)
+            got=$(docker buildx imagetools inspect "$dh" --format '{{json .Manifest}}' | jq -r .digest)
+            if [ "$got" != "$want" ]; then
+              echo "::error::$dh resolves to $got, $t is $want"
+              exit 1
+            fi
+          done < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          trap 'docker rm -f nora-smoke >/dev/null 2>&1 || true' EXIT
+          docker rm -f nora-smoke 2>/dev/null || true
+          docker run --rm -d --name nora-smoke -p 5555:4000 -e NORA_HOST=0.0.0.0 -e NORA_PUBLIC_URL=http://localhost:5555 "$IMAGE:$VERSION"
+          for _ in $(seq 1 10); do
+            curl -sf http://localhost:5555/health >/dev/null && break
+            sleep 2
+          done
+          curl -sf http://localhost:5555/health
+          docker stop nora-smoke
+
+      - name: Sign Docker images (keyless Sigstore)
+        run: |
+          TAGS=($(echo "${{ steps.meta-alpine.outputs.tags }}" | tr "\n" " "))
+          for tag in "${TAGS[@]}"; do
+            [[ "$tag" == *"localhost"* ]] && continue
+            cosign sign --yes "$tag"
+          done
+
+      - name: Clean up Docker resources
+        if: always()
+        run: |
+          docker system prune -af --volumes || true
+
+  package:
+    name: Package (${{ matrix.format }}-${{ matrix.arch }})
+    runs-on: [self-hosted, nora]
+    needs: build
+    permissions:
+      contents: read
+
+    strategy:
+      # One package format failing (e.g. a flaky tool download) must not cancel
+      # the other three — each row is independent.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            nfpm_arch: amd64
+            binary: nora
+            format: deb
+          - arch: amd64
+            nfpm_arch: amd64
+            binary: nora
+            format: rpm
+          - arch: arm64
+            nfpm_arch: arm64
+            binary: nora-linux-arm64
+            format: deb
+          - arch: arm64
+            nfpm_arch: arm64
+            binary: nora-linux-arm64
+            format: rpm
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nora-binary-${{ github.run_id }}
+          path: ./artifacts
+
+      - name: Prepare binary
+        run: |
+          cp ./artifacts/${{ matrix.binary }} ./nora
+          chmod +x ./nora
+
+      - name: Install nfpm
+        run: |
+          set -o pipefail
+          NFPM_VERSION=2.46.3
+          # Prefer a matching nfpm already on the runner (persistent self-hosted
+          # box) — avoids a per-release fetch from the GitHub release CDN, which
+          # has no SLA and has hung mid-stream on transient network blips.
+          if command -v nfpm >/dev/null 2>&1 && nfpm --version 2>/dev/null | grep -q "$NFPM_VERSION"; then
+            echo "using pre-installed nfpm at $(command -v nfpm)"
+            nfpm --version
+            exit 0
+          fi
+          # Fallback: fetch the pinned release, hardened against transient CDN
+          # failures (retries on connection/HTTP errors, bounded timeouts,
+          # pipefail so a truncated download fails the step instead of feeding
+          # tar an empty stream).
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fSL --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 15 --max-time 120 \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar xz -C "$RUNNER_TEMP/bin" nfpm
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/nfpm" --version
+
+      - name: Build ${{ matrix.format }} (${{ matrix.arch }})
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}" \
+          NFPM_ARCH="${{ matrix.nfpm_arch }}" \
+          nfpm package \
+            --config dist/nora.nfpm.yaml \
+            --packager ${{ matrix.format }} \
+            --target ./nora-${{ matrix.arch }}.${{ matrix.format }}
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nora-pkg-${{ matrix.format }}-${{ matrix.arch }}-${{ github.run_id }}
+          path: ./nora-${{ matrix.arch }}.${{ matrix.format }}
+          retention-days: 1
+
+  scan:
+    name: Scan (${{ matrix.name }})
+    runs-on: [self-hosted, nora]
+    needs: merge-image
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: alpine
+            suffix: ""
+          - name: redos
+            suffix: "-redos"
+
+    steps:
+      - name: Set version tag (strip leading v)
+        id: ver
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Trivy — image scan (${{ matrix.name }})
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        timeout-minutes: 15
+        with:
+          scan-type: image
+          image-ref: ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}${{ matrix.suffix }}
+          format: sarif
+          output: trivy-image-${{ matrix.name }}.sarif
+          severity: HIGH,CRITICAL
+          exit-code: 0
+
+      - name: Upload Trivy image results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@a60c4df7a135c7317c1e9ddf9b5a9b07a910dda9 # v4
+        if: always() && hashFiles(format('trivy-image-{0}.sarif', matrix.name))
+        with:
+          sarif_file: trivy-image-${{ matrix.name }}.sarif
+          category: trivy-image-${{ matrix.name }}
+
+  provenance:
+    name: SLSA Provenance
+    needs: build
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@f7dd8c54c2067bafc12ca7a55595d5ee9b75204a # v2.1.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.hash }}"
+      upload-assets: true
+      compile-generator: true
+
+  release:
+    name: GitHub Release
+    runs-on: [self-hosted, nora]
+    needs: [build, package, provenance, merge-image]
+    permissions:
+      contents: write
+      id-token: write  # Sigstore cosign keyless signing
+      packages: write  # cosign needs push for signatures
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Set version tag (strip leading v)
+        id: ver
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nora-binary-${{ github.run_id }}
+          path: ./artifacts
+
+      - name: Download deb/rpm artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: nora-pkg-*-${{ github.run_id }}
+          path: ./packages
+          merge-multiple: true
+
+      - name: Prepare binaries
+        run: |
+          cp ./artifacts/nora ./nora-linux-amd64
+          chmod +x ./nora-linux-amd64
+          sha256sum ./nora-linux-amd64 > nora-linux-amd64.sha256
+          echo "Binary size (amd64): $(du -sh nora-linux-amd64 | cut -f1)"
+          cat nora-linux-amd64.sha256
+
+          cp ./artifacts/nora-linux-arm64 ./nora-linux-arm64
+          chmod +x ./nora-linux-arm64
+          sha256sum ./nora-linux-arm64 > nora-linux-arm64.sha256
+          echo "Binary size (arm64): $(du -sh nora-linux-arm64 | cut -f1)"
+          cat nora-linux-arm64.sha256
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
+        with:
+          format: spdx-json
+          output-file: nora-${{ github.ref_name }}.sbom.spdx.json
+
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
+        with:
+          format: cyclonedx-json
+          output-file: nora-${{ github.ref_name }}.sbom.cdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3
+
+      - name: Sign binaries with cosign (keyless Sigstore)
+        run: |
+          cosign sign-blob --yes \
+            --output-signature nora-linux-amd64.sig \
+            --output-certificate nora-linux-amd64.cert \
+            --bundle nora-linux-amd64.bundle \
+            ./nora-linux-amd64
+          cosign sign-blob --yes \
+            --output-signature nora-linux-arm64.sig \
+            --output-certificate nora-linux-arm64.cert \
+            --bundle nora-linux-arm64.bundle \
+            ./nora-linux-arm64
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          version="${{ steps.ver.outputs.tag }}"
+          awk -v ver="$version" '
+            index($0, "## [" ver "]") == 1 { p = 1; print; next }
+            p && /^## \[/ { exit }
+            p { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section — refusing to publish empty release notes"
+            exit 1
+          fi
+          {
+            echo "content<<RELEASE_NOTES_EOF"
+            cat RELEASE_NOTES.md
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
+        with:
+          generate_release_notes: false
+          files: |
+            nora-linux-amd64
+            nora-linux-amd64.sha256
+            nora-linux-amd64.sig
+            nora-linux-amd64.cert
+            nora-linux-amd64.bundle
+            nora-linux-arm64
+            nora-linux-arm64.sha256
+            nora-linux-arm64.sig
+            nora-linux-arm64.cert
+            nora-linux-arm64.bundle
+            nora-${{ github.ref_name }}.sbom.spdx.json
+            nora-${{ github.ref_name }}.sbom.cdx.json
+            packages/nora-amd64.deb
+            packages/nora-amd64.rpm
+            packages/nora-arm64.deb
+            packages/nora-arm64.rpm
+          body: |
+            ${{ steps.notes.outputs.content }}
+
+            ## Install
+
+            ```bash
+            # x86_64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nora-linux-amd64
+            chmod +x nora-linux-amd64
+            sudo mv nora-linux-amd64 /usr/local/bin/nora
+
+            # ARM64 (Apple Silicon, Graviton, Ampere)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nora-linux-arm64
+            chmod +x nora-linux-arm64
+            sudo mv nora-linux-arm64 /usr/local/bin/nora
+            ```
+
+            ## Docker
+
+            ```bash
+            docker pull getnora/nora:${{ steps.ver.outputs.tag }}
+            ```
+
+            | Variant | Image | Platforms |
+            |---------|-------|-----------|
+            | Alpine (default) | `getnora/nora:${{ steps.ver.outputs.tag }}` | amd64, arm64 |
+            | RED OS | `getnora/nora:${{ steps.ver.outputs.tag }}-redos` | amd64 |
+            | Astra Linux SE | `getnora/nora:${{ steps.ver.outputs.tag }}-astra` | amd64 |
+            | GHCR | `ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}` | amd64, arm64 |
+
+            ## DEB / RPM
+
+            ```bash
+            # Debian / Ubuntu / Astra Linux (amd64)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nora-amd64.deb
+            sudo dpkg -i nora-amd64.deb
+
+            # RHEL / Fedora / RED OS (amd64)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nora-amd64.rpm
+            sudo rpm -i nora-amd64.rpm
+            ```
+
+            ## Changelog
+
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+
+      - name: Mint helm-charts app token
+        id: helm_app
+        if: success()
+        # Short-lived installation token (auto-expires ~1h), minted per run from a
+        # GitHub App scoped to Contents:write on helm-charts only. Nothing to rotate,
+        # nothing to expire. continue-on-error so an App/key misconfig degrades to a
+        # warning below rather than failing an already-published release.
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.NORA_HELM_APP_ID }}
+          private-key: ${{ secrets.NORA_HELM_APP_KEY }}
+          owner: getnora-io
+          repositories: helm-charts
+
+      - name: Notify helm-charts repo
+        if: success() && steps.helm_app.outputs.token != ''
+        # Best-effort downstream bump: the release is already published by this point,
+        # so a dispatch failure must not fail the release. Surface it as a warning.
+        continue-on-error: true
+        run: |
+          if ! gh api repos/getnora-io/helm-charts/dispatches \
+                -f event_type=nora-release \
+                -f 'client_payload[version]=${{ steps.ver.outputs.tag }}'; then
+            echo "::warning title=helm-charts notify failed::dispatch returned non-zero — chart appVersion NOT auto-bumped for ${{ steps.ver.outputs.tag }}; run it manually"
+          fi
+        env:
+          GH_TOKEN: ${{ steps.helm_app.outputs.token }}
+
+  crates-publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: release
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Publish to crates.io
+        run: cargo publish --manifest-path nora-registry/Cargo.toml
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

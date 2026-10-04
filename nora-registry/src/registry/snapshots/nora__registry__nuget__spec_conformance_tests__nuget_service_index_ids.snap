@@ -1,0 +1,10 @@
+---
+source: nora-registry/src/registry/nuget.rs
+expression: ids
+---
+[
+  "http://nora:4000/nuget/v3/flatcontainer/",
+  "http://nora:4000/nuget/v3/registration/",
+  "http://nora:4000/nuget/v3/query",
+  "http://nora:4000/nuget/v3/autocomplete"
+]

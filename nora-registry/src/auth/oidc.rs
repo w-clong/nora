@@ -1,0 +1,583 @@
+// Copyright (c) 2026 The NORA Authors
+// SPDX-License-Identifier: MIT
+
+//! OIDC Workload Identity authentication provider.
+//!
+//! Validates JWT tokens from CI/CD systems (GitHub Actions, GitLab CI)
+//! against configured OIDC issuers with JWKS key caching.
+//!
+//! Security properties:
+//! - Algorithm whitelist per provider (only RS256/ES256 by default)
+//! - Strict issuer binding (never follows jku/x5u from token)
+//! - Per-provider namespace scoping
+//! - Token lifetime ceiling enforcement
+//! - Stale JWKS cache on fetch failure (availability over freshness)
+
+use jsonwebtoken::{
+    dangerous::insecure_decode, decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey,
+    TokenData, Validation,
+};
+use parking_lot::RwLock;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use crate::config::{OidcConfig, OidcProvider, ScopeEnforcement};
+use crate::tokens::Role;
+
+/// Result of a successful OIDC authentication.
+#[derive(Debug, Clone)]
+pub struct OidcIdentity {
+    /// Provider name that validated this token
+    pub provider: String,
+    /// Subject claim from JWT
+    pub subject: String,
+    /// Issuer claim
+    pub issuer: String,
+    /// Assigned role based on role_rules
+    pub role: Role,
+    /// Provider's `namespace_scope` patterns (segment-aware globs). `["*"]` = all
+    /// namespaces. Enforced on writes via `auth::enforce_namespace_scope`.
+    /// Always the provider's hard ceiling, whatever the matched rule says.
+    pub namespace_scope: Vec<String>,
+    /// The matched role rule's `namespace_scope`, if it set one. Enforced in
+    /// addition to the provider scope — a write must satisfy both, so a rule
+    /// can only narrow the provider ceiling, never widen past it.
+    pub rule_namespace_scope: Option<Vec<String>>,
+    /// Whether `namespace_scope` is enforced (403 on mismatch) or only audited
+    /// for this provider.
+    pub namespace_scope_enforcement: ScopeEnforcement,
+}
+
+/// Standard JWT claims we extract.
+#[derive(Debug, Deserialize, Serialize)]
+struct Claims {
+    iss: Option<String>,
+    sub: Option<String>,
+    aud: Option<Audience>,
+    exp: Option<u64>,
+    iat: Option<u64>,
+    nbf: Option<u64>,
+}
+
+/// Audience can be a string or array of strings.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+enum Audience {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl Audience {
+    #[cfg(test)]
+    fn contains(&self, expected: &str) -> bool {
+        match self {
+            Audience::Single(s) => s == expected,
+            Audience::Multiple(v) => v.iter().any(|s| s == expected),
+        }
+    }
+}
+
+/// Cached JWKS for a provider.
+struct CachedJwks {
+    jwks: JwkSet,
+    fetched_at: Instant,
+}
+
+/// Minimal OIDC discovery document (only the fields we need).
+#[derive(Deserialize)]
+struct OidcDiscoveryDoc {
+    #[serde(default)]
+    jwks_uri: String,
+}
+
+/// OIDC validator — thread-safe, holds cached JWKS per issuer.
+pub struct OidcValidator {
+    config: OidcConfig,
+    http_client: Client,
+    /// issuer URL → cached JWKS
+    jwks_cache: RwLock<HashMap<String, CachedJwks>>,
+}
+
+/// Per-request timeout for OIDC HTTP calls (discovery + JWKS fetch).
+const OIDC_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl OidcValidator {
+    /// Create a new validator from config.
+    ///
+    /// The client should be pre-configured with any required TLS settings
+    /// (e.g. custom CA certificates). Per-request timeouts are applied internally.
+    pub fn new(config: OidcConfig, http_client: Client) -> Self {
+        Self {
+            config,
+            http_client,
+            jwks_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Check if OIDC is enabled and has providers configured.
+    pub fn is_active(&self) -> bool {
+        self.config.enabled && !self.config.providers.is_empty()
+    }
+
+    /// Validate a Bearer token as an OIDC JWT.
+    /// Returns the identity on success, or an error string.
+    pub async fn validate_token(&self, token: &str) -> Result<OidcIdentity, String> {
+        if !self.is_active() {
+            return Err("OIDC not enabled".to_string());
+        }
+
+        // Decode header WITHOUT validation to determine issuer and kid
+        let header = decode_header(token).map_err(|e| format!("Invalid JWT header: {}", e))?;
+
+        // Security: reject alg=none and symmetric algorithms globally
+        match header.alg {
+            Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
+                return Err("Symmetric algorithms not allowed for OIDC".to_string());
+            }
+            _ => {}
+        }
+
+        // Peek at claims to find issuer (unverified — for routing only)
+        let unverified: Claims = insecure_decode::<Claims>(token)
+            .map_err(|e| format!("Cannot decode claims: {}", e))?
+            .claims;
+
+        let issuer = unverified.iss.as_deref().ok_or("Token missing iss claim")?;
+
+        // Find matching provider
+        let provider = self
+            .config
+            .providers
+            .iter()
+            .find(|p| p.enabled && p.issuer == issuer)
+            .ok_or_else(|| format!("No matching OIDC provider for issuer: {}", issuer))?;
+
+        // Verify algorithm is in provider's whitelist
+        let alg_str = format!("{:?}", header.alg);
+        if !provider.algorithms.iter().any(|a| a == &alg_str) {
+            return Err(format!(
+                "Algorithm {} not in provider whitelist: {:?}",
+                alg_str, provider.algorithms
+            ));
+        }
+
+        // Get JWKS (cached or fetch)
+        let jwks = self.get_jwks(provider).await?;
+
+        // Find the matching key by kid
+        let kid = header.kid.as_deref().unwrap_or("");
+        let jwk = jwks
+            .keys
+            .iter()
+            .find(|k| {
+                k.common.key_id.as_deref() == Some(kid) || (kid.is_empty() && jwks.keys.len() == 1)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "No matching key (kid={}) in JWKS for provider {}",
+                    kid, provider.name
+                )
+            })?;
+
+        // Build decoding key from JWK
+        let decoding_key =
+            DecodingKey::from_jwk(jwk).map_err(|e| format!("Cannot build key from JWK: {}", e))?;
+
+        // Full validation
+        let mut validation = Validation::new(header.alg);
+        validation.set_issuer(&[&provider.issuer]);
+        validation.leeway = self.config.leeway_secs;
+
+        if !provider.audience.is_empty() {
+            validation.set_audience(&[&provider.audience]);
+        } else {
+            validation.validate_aud = false;
+        }
+
+        let token_data: TokenData<Claims> = decode(token, &decoding_key, &validation)
+            .map_err(|e| format!("JWT validation failed: {}", e))?;
+
+        let claims = token_data.claims;
+
+        // Enforce token lifetime ceiling
+        if let (Some(iat), Some(exp)) = (claims.iat, claims.exp) {
+            let lifetime = exp.saturating_sub(iat);
+            if lifetime > provider.max_token_lifetime_secs {
+                return Err(format!(
+                    "Token lifetime {} exceeds max {} for provider {}",
+                    lifetime, provider.max_token_lifetime_secs, provider.name
+                ));
+            }
+        }
+
+        // Map claims to role via role_rules
+        let subject = claims.sub.unwrap_or_default();
+        let (role, rule_scope) = self.match_role(provider, &subject).ok_or_else(|| {
+            format!(
+                "No role rule matches sub='{}' for provider {}",
+                subject, provider.name
+            )
+        })?;
+
+        Ok(OidcIdentity {
+            provider: provider.name.clone(),
+            subject,
+            issuer: provider.issuer.clone(),
+            role,
+            namespace_scope: provider.namespace_scope.clone(),
+            rule_namespace_scope: rule_scope,
+            namespace_scope_enforcement: provider.namespace_scope_enforcement,
+        })
+    }
+
+    /// Fetch or return cached JWKS for a provider.
+    async fn get_jwks(&self, provider: &OidcProvider) -> Result<JwkSet, String> {
+        let cache_ttl = Duration::from_secs(self.config.jwks_cache_secs);
+
+        // Try cache first
+        {
+            let cache = self.jwks_cache.read();
+            if let Some(cached) = cache.get(&provider.issuer) {
+                if cached.fetched_at.elapsed() < cache_ttl {
+                    return Ok(cached.jwks.clone());
+                }
+            }
+        }
+
+        // Resolve JWKS URI: explicit config > OIDC discovery > legacy fallback
+        let jwks_uri = self.resolve_jwks_uri(provider).await?;
+
+        match self.fetch_jwks(&jwks_uri).await {
+            Ok(jwks) => {
+                let mut cache = self.jwks_cache.write();
+                cache.insert(
+                    provider.issuer.clone(),
+                    CachedJwks {
+                        jwks: jwks.clone(),
+                        fetched_at: Instant::now(),
+                    },
+                );
+                Ok(jwks)
+            }
+            Err(e) => {
+                // Stale fallback: return expired cache if available
+                let cache = self.jwks_cache.read();
+                if let Some(cached) = cache.get(&provider.issuer) {
+                    tracing::warn!(
+                        provider = %provider.name,
+                        error = %e,
+                        stale_age_secs = cached.fetched_at.elapsed().as_secs(),
+                        "JWKS fetch failed, serving stale keys"
+                    );
+                    return Ok(cached.jwks.clone());
+                }
+                Err(format!("JWKS fetch failed for {}: {}", provider.name, e))
+            }
+        }
+    }
+
+    /// Resolve the JWKS URI for a provider using (in order):
+    /// 1. Explicit `jwks_uri` from config
+    /// 2. OIDC discovery via `.well-known/openid-configuration`
+    /// 3. Fallback to `{issuer}/.well-known/jwks.json`
+    async fn resolve_jwks_uri(&self, provider: &OidcProvider) -> Result<String, String> {
+        // 1. Explicit override
+        if let Some(ref uri) = provider.jwks_uri {
+            return Ok(uri.clone());
+        }
+
+        // 2. OIDC discovery
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            provider.issuer.trim_end_matches('/')
+        );
+
+        if let Ok(resp) = self
+            .http_client
+            .get(&discovery_url)
+            .timeout(OIDC_REQUEST_TIMEOUT)
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(config) = resp.json::<OidcDiscoveryDoc>().await {
+                    if !config.jwks_uri.is_empty() {
+                        tracing::debug!(
+                            provider = %provider.name,
+                            jwks_uri = %config.jwks_uri,
+                            "Discovered JWKS URI via openid-configuration"
+                        );
+                        return Ok(config.jwks_uri);
+                    }
+                }
+            }
+        }
+
+        // 3. Legacy fallback
+        Ok(format!(
+            "{}/.well-known/jwks.json",
+            provider.issuer.trim_end_matches('/')
+        ))
+    }
+
+    /// HTTP fetch of JWKS from provider.
+    async fn fetch_jwks(&self, url: &str) -> Result<JwkSet, String> {
+        let resp = self
+            .http_client
+            .get(url)
+            .timeout(OIDC_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP error: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("JWKS endpoint returned {}", resp.status()));
+        }
+
+        resp.json::<JwkSet>()
+            .await
+            .map_err(|e| format!("JWKS parse error: {}", e))
+    }
+
+    /// Match subject against provider's role_rules. First match wins.
+    /// Returns the role plus the rule's namespace-scope override, if any.
+    fn match_role(
+        &self,
+        provider: &OidcProvider,
+        subject: &str,
+    ) -> Option<(Role, Option<Vec<String>>)> {
+        for rule in &provider.role_rules {
+            if glob_match(&rule.pattern, subject) {
+                let role = match rule.role.as_str() {
+                    "admin" => Role::Admin,
+                    "write" => Role::Write,
+                    "read" => Role::Read,
+                    _ => return None,
+                };
+                return Some((role, rule.namespace_scope.clone()));
+            }
+        }
+        None
+    }
+}
+
+/// Simple glob matching: supports `*` (any chars within segment) and `**` is not needed
+/// since sub claims use `:` as separator, not `/`.
+/// Patterns: "repo:org/*" matches "repo:org/myrepo:ref:refs/heads/main"
+fn glob_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        // No wildcard — exact match
+        return pattern == value;
+    }
+
+    // First part must be prefix, last part must be suffix
+    let mut remaining = value;
+
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // Must start with this
+            if !remaining.starts_with(part) {
+                return false;
+            }
+            remaining = &remaining[part.len()..];
+        } else if i == parts.len() - 1 {
+            // Must end with this
+            if !remaining.ends_with(part) {
+                return false;
+            }
+            return true;
+        } else {
+            // Must contain this
+            match remaining.find(part) {
+                Some(pos) => remaining = &remaining[pos + part.len()..],
+                None => return false,
+            }
+        }
+    }
+
+    true
+}
+
+/// Classify a [`OidcValidator::validate_token`] rejection string into a bounded
+/// reason label for metrics/logs (#994). The caller still logs the full string;
+/// this only buckets it so `nora_auth_oidc_rejected_total{reason}` stays
+/// low-cardinality (no issuer/subject/provider in the label).
+pub fn classify_rejection(reason: &str) -> &'static str {
+    if reason.starts_with("OIDC not enabled") {
+        "disabled"
+    } else if reason.starts_with("No matching OIDC provider") {
+        "no_provider"
+    } else if reason.starts_with("Token lifetime") {
+        "lifetime_exceeded"
+    } else if reason.starts_with("No role rule matches") {
+        "no_role_rule"
+    } else if reason.starts_with("Symmetric algorithms") || reason.starts_with("Algorithm ") {
+        "algorithm"
+    } else if reason.contains("JWK") {
+        // JWKS fetch/endpoint/key errors ("...JWK...", "JWKS ..."); checked
+        // before jwt_invalid because none of those strings contain "JWK".
+        "jwks"
+    } else if reason.starts_with("Invalid JWT header")
+        || reason.starts_with("Cannot decode claims")
+        || reason.starts_with("JWT validation failed")
+    {
+        "jwt_invalid"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::config::{OidcProvider, OidcRoleRule};
+
+    #[test]
+    fn classify_rejection_buckets_each_real_reason() {
+        // #994 — the exact strings validate_token returns must each map to a
+        // distinct, bounded reason, not collapse to "other".
+        assert_eq!(classify_rejection("OIDC not enabled"), "disabled");
+        assert_eq!(
+            classify_rejection("No matching OIDC provider for issuer: https://gitlab.example/"),
+            "no_provider",
+        );
+        assert_eq!(
+            classify_rejection("Token lifetime 3600 exceeds max 900 for provider gitlab"),
+            "lifetime_exceeded",
+        );
+        assert_eq!(
+            classify_rejection(
+                "No role rule matches sub='project_path:acme/app' for provider gitlab"
+            ),
+            "no_role_rule",
+        );
+        assert_eq!(
+            classify_rejection("Symmetric algorithms not allowed for OIDC"),
+            "algorithm",
+        );
+        assert_eq!(
+            classify_rejection("Algorithm HS256 not in provider whitelist: [\"RS256\"]"),
+            "algorithm",
+        );
+        assert_eq!(
+            classify_rejection("JWT validation failed: InvalidAudience"),
+            "jwt_invalid",
+        );
+        assert_eq!(classify_rejection("Cannot build key from JWK: bad"), "jwks");
+        assert_eq!(
+            classify_rejection("JWKS fetch failed for gitlab: timeout"),
+            "jwks",
+        );
+        assert_eq!(classify_rejection("an unmapped failure"), "other");
+    }
+
+    #[test]
+    fn test_glob_match_exact() {
+        assert!(glob_match("repo:org/myrepo", "repo:org/myrepo"));
+        assert!(!glob_match("repo:org/myrepo", "repo:org/other"));
+    }
+
+    #[test]
+    fn test_glob_match_wildcard() {
+        assert!(glob_match("repo:org/*", "repo:org/myrepo"));
+        assert!(glob_match(
+            "repo:org/*",
+            "repo:org/myrepo:ref:refs/heads/main"
+        ));
+        assert!(!glob_match("repo:org/*", "repo:other/myrepo"));
+    }
+
+    #[test]
+    fn test_glob_match_star_only() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn test_glob_match_middle() {
+        assert!(glob_match(
+            "repo:*:ref:refs/heads/main",
+            "repo:org/myrepo:ref:refs/heads/main"
+        ));
+        assert!(!glob_match(
+            "repo:*:ref:refs/heads/main",
+            "repo:org/myrepo:ref:refs/heads/dev"
+        ));
+    }
+
+    #[test]
+    fn test_match_role_first_wins() {
+        let config = OidcConfig::default();
+        let validator = OidcValidator::new(config, Client::new());
+
+        let provider = OidcProvider {
+            name: "test".to_string(),
+            issuer: "https://test".to_string(),
+            jwks_uri: None,
+            audience: "nora".to_string(),
+            algorithms: vec!["RS256".to_string()],
+            max_token_lifetime_secs: 900,
+            namespace_scope: vec!["*".to_string()],
+            namespace_scope_enforcement: crate::config::ScopeEnforcement::Enforce,
+            enabled: true,
+            role_rules: vec![
+                OidcRoleRule {
+                    pattern: "repo:myorg/*:ref:refs/heads/main".to_string(),
+                    role: "write".to_string(),
+                    namespace_scope: None,
+                },
+                OidcRoleRule {
+                    pattern: "repo:myorg/*:pull_request".to_string(),
+                    role: "write".to_string(),
+                    namespace_scope: Some(vec!["ci-transport/**".to_string()]),
+                },
+                OidcRoleRule {
+                    pattern: "repo:myorg/*".to_string(),
+                    role: "read".to_string(),
+                    namespace_scope: None,
+                },
+            ],
+        };
+
+        // main branch → write (first rule), inherits provider scope
+        let m = validator.match_role(&provider, "repo:myorg/app:ref:refs/heads/main");
+        assert!(matches!(m, Some((Role::Write, None))));
+
+        // pull_request → write narrowed to the rule's scope
+        let m = validator.match_role(&provider, "repo:myorg/app:pull_request");
+        let (role, scope) = m.unwrap();
+        assert_eq!(role, Role::Write);
+        assert_eq!(scope.as_deref(), Some(&["ci-transport/**".to_string()][..]));
+
+        // other branch → read (last rule)
+        let m = validator.match_role(&provider, "repo:myorg/app:ref:refs/heads/dev");
+        assert!(matches!(m, Some((Role::Read, None))));
+
+        // different org → no match
+        let m = validator.match_role(&provider, "repo:other/app:ref:refs/heads/main");
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn test_audience_contains() {
+        let single = Audience::Single("nora".to_string());
+        assert!(single.contains("nora"));
+        assert!(!single.contains("other"));
+
+        let multi = Audience::Multiple(vec!["nora".to_string(), "api".to_string()]);
+        assert!(multi.contains("nora"));
+        assert!(multi.contains("api"));
+        assert!(!multi.contains("other"));
+    }
+}

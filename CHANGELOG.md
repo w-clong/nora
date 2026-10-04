@@ -1,0 +1,1225 @@
+# Changelog
+## [Unreleased]
+
+## [1.3.2] - 2026-09-19
+
+### Added
+- **CPAN proxy registry (#1004)** — NORA can now proxy and cache CPAN indexes and distribution archives, apply curation controls, and browse cached distributions with all available versions in the web UI. Contributed by @0x62ash.
+
+### Changed
+- **`lock-audit` runs in CI (#980)** — the check guards a documented invariant (`publish_lock` serializes all writes to the same artifact path) but was referenced only from the `Makefile`, so nothing ran it and a red `make check` reached v1.3.0. It is now a step in the Coherence job, with its self-test running first: a heuristic over source text that breaks prints nothing, which is indistinguishable from a clean tree. The self-test also runs the audit under every awk on the image, so a gawk-only construct creeping back in fails the job instead of quietly disabling the check.
+- **No spurious htpasswd warning in OIDC-only deployments (#996)** — `Auth enabled but htpasswd file not found or empty` was logged at `warn` even when OIDC providers are configured and are the intended (and only) write path, training operators to ignore auth warnings. With OIDC active it is now an `info` line (`Basic auth disabled (no htpasswd); OIDC is the write path`); the `warn` remains when neither htpasswd nor OIDC is configured.
+
+### Fixed
+- **Audit log records the real actor, not `api` (#985)** — every audit entry used the literal `"api"` as the actor, so a delete or overwrite made with an admin token and one made by a Basic-auth user (or anonymously) were indistinguishable in the security log. Write events (push, delete, overwrite, reindex) now record the authenticated username, or `anonymous` when the request carries no identity; background cache events (proxy fetch, cache hit, local pull) record `proxy`.
+- **Docker repository page cost is bounded, not registry-wide (#986)** — opening `/ui/docker/{name}` listed every key under `docker/` to find namespaced copies of the image, so each page view grew slower as the whole registry grew (on an object store, a listing whose size tracks the total object count). It now lists only the image's own prefixes — `docker/{name}/manifests/` and, for each configured upstream, `docker/{namespace}/{name}/manifests/` — a bounded number of requests independent of how many unrelated repositories exist. Namespaced tags are still shown.
+- **OpenAPI `/health` documents `registries` as an open map (#987)** — the schema described `registries` as a fixed struct with seven named fields (`docker`, `maven`, `npm`, `cargo`, `pypi`, `go`, `raw`), so clients generated from the document missed every format added since (RubyGems, Terraform, Ansible, NuGet, Pub, Conan, RPM, Debian, CPAN) and treated disabled formats as always present. It now matches the runtime `HashMap<String, String>` of enabled registries — an `additionalProperties` string map keyed by any `RegistryType::all()` name.
+- **PyPI simple index reads file hashes from one listing (#991)** — `GET /simple/{name}/` read each locally stored file's `.sha256` sidecar with its own storage request, so a package with N files cost N+1 round-trips per response in both the HTML and the PEP 691 JSON form; on an object store each is a network request. Every stored file now also gets an empty marker object whose key carries its digest (`pypi-sha256/<project>/<filename>/<sha256>`), and the index reads every digest from one listing, so its cost no longer depends on the number of files. Files stored before the upgrade are served from their sidecars and get their markers in the background; a file with no marker, or with more than one, is always served from its sidecar, which is still written and stays authoritative. Retention removes a file's markers together with the file.
+- **Image tags move only after the builds, packages and provenance have succeeded (#992)** — the release workflow pushed the RED OS and Astra images under their version and `latest-*` tags in its first job, before the arm64 image, the deb/rpm packages and SLSA provenance were built, and the alpine tags moved before the packages and provenance existed; when a later job failed, public channels pointed at a version with no GitHub Release. Every image is now pushed by digest only, and a single job moves all public tags — alpine, RED OS and Astra, in GHCR and Docker Hub — once the arm64 image, packages and provenance have succeeded. Before any tag moves it starts each variant from its digest and checks `/health`; after promotion it checks that every promoted tag resolves to the expected digest in both registries and starts the promoted multi-arch alpine tag. Re-running the job promotes the same digests. The GitHub Release is still created after promotion, so if that last job fails the tags stay public until it is re-run. RED OS and Astra images are now signed with cosign, and the post-release gate verifies their signatures.
+- **OIDC token rejections are logged and counted (#994)** — a rejected OIDC token returned a generic `401` while the reason (a lifetime ceiling, a wrong `aud`, a bad signature, a missing role rule) was discarded, so operators could not tell the cases apart. The auth middleware now emits a `warn` event carrying the full reason (never the token) and increments `nora_auth_oidc_rejected_total{reason}` with a bounded reason set (`disabled`, `no_provider`, `lifetime_exceeded`, `no_role_rule`, `algorithm`, `jwt_invalid`, `jwks`, `other`).
+- **Serve Android APKs with their package MIME type (#997)** — raw `.apk` downloads now use `application/vnd.android.package-archive`, allowing Android browsers to hand them directly to the package installer.
+- **A proxied Docker blob streams while it is still being fetched (#1001)** — a cache miss used to download the whole blob to a temp file, store it, and only then start the response, so a client saw nothing, not even the status line, until the blob was fully cached. containerd 2.3 caps that wait at a hard-coded 30 s (`ResponseHeaderTimeout`, not configurable from `hosts.toml`), retries once and gives up, and each abandoned request deleted the partial spool; on a slow upstream link every layer over a few hundred MB was re-fetched from scratch on every attempt and never cached — one 1.27 GB layer was started 56 times in four days without completing once. The response now goes out as soon as upstream has answered, the body follows the spool file as it grows, and the fill runs detached from the request, so a client that gives up mid-fill still leaves a cached blob behind for its retry. The digest is still verified before the blob is stored, and the last byte of the response is withheld until that verdict is in, so a poisoned upstream can never complete a `Content-Length` body; a mismatch, which was a `502` sent before any bytes, is now an aborted body on a `200`, the same failure mode the cached serve path already has. A proxied digest enters quarantine only once its fetch has verified, so a failed or poisoned fetch no longer starts the cooldown clock for the real blob.
+
+## [1.3.1] - 2026-09-09
+
+### Changed
+- **npm rebuilds a packument concurrently (#956 follow-up)** — `regenerate_packument` walked `versions/` and `dist-tags/` one key at a time. On an object store each key is a round-trip, and #956 put that walk on a read path, so the first request after a packument went missing paid one round-trip per version: 505 reads and 0.77 s for a 500-version package against a loopback S3 store, linear from there. It now reads them through the same buffered fan-out the RPM and Deb index rebuilds use, keeping the lenient behaviour — an unreadable or unparsable version is skipped rather than failing the rebuild.
+- **Every storage round-trip is counted (#969 follow-up)** — `stat`, `pin`, `list` and `list_with_meta` reached the backend without touching `nora_storage_operations_total`, which is why a handler issuing one `stat()` per file (tens of thousands of HEAD requests on a single PyPI index response) moved no metric and could only be found by reading code. All four now increment it; on `stat`/`pin` an absent object or an unpinned one is `status="miss"`, so ordinary misses do not inflate error-rate alerting. Counters only — no behavioural change.
+- **Changelog entries live in `changelog.d/` (#971 follow-up)** — `## [Unreleased]` in `CHANGELOG.md` is no longer edited by hand. Each change adds `changelog.d/<number>.<category>.md`, and `scripts/changelog-fragments.sh` assembles them (`--check`, `--render`, `--apply`, `--release <version>`). Three pull requests merged into 1.3.1 each added a bullet to the same few lines and each conflicted with the previous one; separate files cannot. A `.gitattributes` union merge was the lighter alternative and was rejected: it duplicates the `### Fixed` heading when two branches both introduce it, and it is unclear whether the merge performed on the forge honours the driver at all, which is where the conflicts actually surfaced.
+
+### Fixed
+- **PyPI simple JSON no longer stats every file (#969)** — the PEP 700 fields added in 1.3.0 made `GET /simple/{name}/` with a JSON `Accept` header issue one storage `stat()` per file in the index, serially. On an object store that is a HEAD round-trip each, so the response time scaled with the number of files the index lists and uv — which always negotiates the JSON index — hit its timeout; the HTML index pip uses was never on that path. Each file’s `size` now comes from the listing the handler already performs, and the cached `dates.json` is read once per response instead of twice. Measured on S3 against a 40 000-file proxied index: `uv lock` went from 129.8 s and 59 764 storage HEAD requests, failing after three retries, to 0.5 s and 2. A second regression on the same path is fixed with it: an upstream that answers the PEP 691 JSON without `upload-time` left nothing cached, so every request re-downloaded the whole upstream index; it is now recorded once, while a failed fetch still caches nothing so a transient outage stays retryable.
+- **`lock-audit` no longer depends on gawk (#971 follow-up)** — Checks 1 and 3 used gawk's three-argument `match()`, which mawk rejects. mawk is the default `awk` on Debian, Ubuntu and the CI images, and an aborted awk prints nothing — so on any machine without gawk the audit reported no findings and looked clean. The awk programs are now POSIX, and `scripts/test-lock-audit.sh` runs the audit under every implementation it finds, asserting they agree *and* that each run still produced the known finding, so "both silent because both aborted" cannot pass.
+- **`lock-audit` no longer reports a guard that cannot drop early (#971)** — Check 2 scanned forward from the end of a guarded block to the next column-0 `}` and flagged the first storage write it met, with no notion of branch exclusivity. A `publish_lock` taken under `if !is_tarball` was therefore reported against a write under `if is_tarball`, which no request can reach on the same path. The scan now skips a write whose enclosing `if` chain contains the textual negation of a condition enclosing the guard. Where the reasoning is beyond textual analysis, a `// LOCK-SAFE: <reason>` comment inside the block of the write exempts it, with the reason recorded next to the code; a bare marker with no reason silences nothing, and the function-level markers the repo already carries are deliberately not honoured, because a function-wide exemption would hide a genuine finding elsewhere in the same handler. `scripts/test-lock-audit.sh` pins all four directions.
+- **npm no longer caches a proxied packument over a locally owned key (#975)** — `npm/{name}/metadata.json` is the assembled form of keys this registry owns, but the proxy branch cached the upstream document there unconditionally. On the metadata path that branch is reached with local versions present only by falling through the rebuild — its write failed, or the read-back missed — and the cached upstream document then dropped every locally published version from the packument. It did not self-heal, because the read-path rebuild triggers on the key being absent and it now existed with the wrong content, so `npm install pkg@<locally-published-version>` failed until the next publish. The write also landed unserialized against the `publish_lock` released a few lines above, so a concurrent publish could be overwritten. The upstream bytes are still served for that request; only the write is skipped, and the next request retries the rebuild.
+
+## [1.3.0] - 2026-09-06
+
+### Added
+- **PyPI Simple JSON carries PEP 700 fields (#896)** — the PEP 691 JSON response (`application/vnd.pypi.simple.v1+json`) now also emits `meta.api-version: "1.1"`, a project-level `versions[]` list, and per-file `upload-time` (RFC 3339) and `size` (bytes), so tools like Renovate can compute a minimum release age without fetching every file. `size` is emitted for locally stored artifacts and `upload-time` from the cached upstream dates on the proxy path — each is included where known.
+- **Hash pins on S3/GCS via object metadata** — the SHA-256 integrity pin is no longer a local-filesystem-only feature. On object-store backends it is written as the user-defined `sha256` object metadata, atomically with the object, and read back on GET/HEAD, so buffered reads verify at rest and raw files get `ETag`, `If-None-Match` (304) and `If-Match` conditional overwrite on every backend. Pins are now a backend concern: the local backend keeps its NDJSON sidecar (same path and format, no migration), the object-store backend keeps object metadata, and the storage wrapper only validates keys and runs the fail-closed verify gate. Objects written before the upgrade carry no metadata and stay open-world until they are rewritten; `nora re-pin` rewrites the object on an object store, since object metadata cannot be changed in place.
+- **Raw upload integrity via `Repr-Digest` (RFC 9530)** — a raw `PUT` may declare `Repr-Digest: sha-256=:BASE64:`; NORA verifies the received body against it before committing, so a corrupted or truncated upload is rejected with `400` instead of being pinned. The pin itself is always the server-computed hash; the header only gates the commit. A `Repr-Digest` without a sha-256 entry is rejected rather than silently skipped.
+- **npm serves the abbreviated packument to installers** — `npm install` asks for `application/vnd.npm.install-v1+json`, and NORA ignored it and returned the full document to every client. The packument path now projects to npm's abbreviated shape, keeping the per-version fields an installer actually resolves on (`dependencies`, `os`, `cpu`, `engines`, `peerDependenciesMeta`, `dist`, `deprecated`) and dropping readme, maintainers, repository, per-version `description`, `scripts` and `gitHead`. Measured against a live upstream with every version preserved: lodash 247 652 → 71 989 B (−70.9%), express 804 975 → 344 703 B (−57.2%). The short form is derived locally rather than requested upstream, so exactly one canonical object stays cached per package and a short document can never displace the full one; `Vary: Accept` goes with it, because metadata is `Cache-Control: public` and the body now varies by a request header. An unparsable body is served unchanged rather than turned into an error (#957).
+
+### Changed
+- **Compile-time integrity witness on the streaming serve path (#849)** — the streaming artifact serve now routes through a sealed sole-sink whose only constructor takes an EOF-verifying stream, so handing a raw reader to the response body on an integrity path is a compile error — the type-level match of the buffered `verified_body` sink. A blob tampered on disk aborts the body mid-stream (the client gets a broken transfer, never the tampered bytes under a clean `200`) instead of streaming out unverified; explicit partial-content range serves take a separate open-world sink.
+- **Registry dispatch is keyed on the `RegistryType` enum (#369)** — dispatch across config, retention, metrics and the UI is now an exhaustive `match RegistryType` generated from one list, instead of scattered string comparisons. Adding a format is a single line and can no longer silently miss a call site (it becomes a compile error). No behavioral change.
+- **Blocklist rules with a literal name are looked up by name (#953)** — `BlocklistFilter::evaluate` ran three glob matches per rule on every artifact download, which is free for a hand-written file of a few dozen rules and not free once the file is generated. A rule whose `name` is a literal now sits in a hash map and a rule whose name is a pattern stays in a scan; the winner is still the first matching rule in file order, so the `reason` a client reads in the 403 does not change.
+
+### Security
+- **The repository signing key is never enumerated by storage `list()` (#891)** — the OpenPGP signing key at `<storage.path>/.signing/nora.key` (persisted owner-only, `0600`) was swept into every enumeration-based operation because `list()`/`list_with_meta()` excluded only the pin sidecar: `backup` wrote it into the tar at `0644`, `migrate --to s3` copied it into the bucket as a plaintext object, and GC/retention and the browse UI treated it as an artifact. Both backends now exclude the `.signing/` prefix from enumeration, so the key can neither be exfiltrated (tar / object) nor deleted; it is loaded via direct filesystem I/O and never through `list()`, so there is no runtime impact. Provision the key out-of-band.
+
+### Fixed
+- **npm rebuilds a missing packument instead of answering 404** — a hosted package whose derived `metadata.json` was absent returned `404` while every published version was still sitting in storage. The reassembly already existed (`regenerate_packument`, which lists `versions/`, `dist-tags/` and `pkg.json`) but only the publish path reached it, so a read fell through to the upstream proxy and 404'd for a package that exists only in this registry. The read path now rebuilds when `versions/` is non-empty, serves the result and re-materializes the packument so the cost is paid once — under the same `publish_lock` as publish, so a fleet stampeding one package rebuilds it once rather than once per request, and before the namespace guard, because serving locally-owned bytes is always allowed while that guard exists to stop the upstream fetch. A name with nothing behind it still returns 404. New `nora_packument_rebuilt_total{registry}`: a non-zero rate means storage was written or restored outside NORA (#956).
+- **Docker GC keeps the digest alias of a tagged manifest (#949)** — since tag-rooted GC shipped in 1.2.2, a GC run deleted `manifests/sha256:<digest>.json` while `manifests/<tag>.json` with the same bytes survived, so pulling a tagged image by digest returned 404 afterwards. The mark phase now roots each tag manifest's digest alias, and an orphaned digest manifest takes its `.meta.json` sidecar with it instead of leaking it forever.
+- **Retention rebuilds the npm packument after deleting versions (#961)** — npm retention deleted a version's tarball and `.sha256` sidecar and nothing else, so the per-version document and the packument entry survived and the registry kept advertising versions it could no longer deliver. The version's key set now includes `npm/<pkg>/versions/<v>.json`, and the packument is regenerated afterwards under the same publish lock, the way retention already rebuilds RPM and Debian indexes.
+
+## [1.2.2] - 2026-08-30
+
+### Added
+- **Size-based eviction for proxy-cached RPM and Debian files (#866)** — `[gc] proxy_cache_max_bytes` (`NORA_GC_PROXY_CACHE_MAX_BYTES`, default `0` = off) makes GC evict the oldest proxy-cached files by mtime until the cache is within the budget. Hosted packages and repository index files (`repodata/`, `Packages`, `Release`) are never evicted. New metrics `nora_gc_proxy_cache_evicted_total` and `nora_gc_proxy_cache_bytes_freed_total`; `nora gc` prints an eviction summary.
+
+### Changed
+- **Docker GC is rooted at tags (#655)** — GC built the referenced-blob set from every stored manifest, so a re-pushed tag left its previous digest manifest behind, and that manifest kept its layers referenced forever. The set is now built from tag manifests only, so digest manifests that no tag reaches, and the layers only they hold, are reclaimed.
+- **Maven proxy metadata is not rewritten when nothing changed (#888)** — under a low or zero `metadata_ttl`, every metadata request wrote the merged `maven-metadata.xml` and its four checksums back to storage even when the merged document was byte-identical to the cached one. Those five writes are now skipped when nothing changed.
+
+### Security
+- **Anonymous dashboard callers no longer see proxy upstreams (#934)** — with `anonymous_read = true` the dashboard API listed every mount point's upstream registries to unauthenticated callers, disclosing the proxy topology. Unauthenticated responses now carry an empty `proxy_upstreams`, and credentials sent to a publicly browsable page are validated so authenticated users still see them.
+
+### Fixed
+- **Docker retention counts only tags toward `keep_last` (#932)** — every push stores a manifest under both its tag and its digest, and retention counted both, so `keep_last = 3` on four tags kept two. Digest references are now skipped by retention and filtered out of the tag list API.
+- **PyPI follows relative links in upstream mirror indexes (#877)** — mirrors that return relative `href`s in the simple index (for example `../../packages/torch-2.4.0.whl`) failed because the raw relative path was rejected as an invalid URL. Links are now resolved against the index page URL.
+
+## [1.2.1] - 2026-08-29
+
+### Fixed
+- **Retention `exclude_tags` no longer uses up the `keep_last` budget (#926)** — excluded versions took positions in the sorted version list without being counted as kept, so when they sat at the top, versions below them were pushed past the `keep_last` threshold and deleted. Only non-excluded versions now count toward `keep_last`.
+- **GC no longer prunes npm metadata in proxy mode (#925)** — tarballs of a proxied package are cached on demand, so a missing local tarball is expected, but GC treated it as an orphan and removed the version from the cached metadata. The npm phantom cleanup is skipped when npm runs as a proxy.
+- **npm revalidation no longer loops on a missing cached body (#867)** — a `304 Not Modified` whose cached body was gone returned nothing but left the `.meta` validators in place, so every TTL cycle sent the same validators, got another 304 and never recovered. The stale validators are now deleted so the next request fetches the document again.
+
+## [1.2.0] - 2026-08-23
+
+### Added
+- **Docker cross-repo blob mount (`?mount=&from=`)** — `POST /v2/{name}/blobs/uploads/?mount={digest}&from={repo}` copies a blob from another repository on the same registry instead of re-uploading it. Returns `201 Created` with `Location` on success, falls back to a regular upload session if the source blob is missing (#917).
+- **Resumable downloads (`Range` / `206 Partial Content`) for every format** — what Docker blob GET gained in #657 now covers all artifact payloads: maven release artifacts, npm tarballs, pypi files, gems, cargo `.crate`s, go module zips, nuget `.nupkg`s, terraform provider/module archives, conan blobs, deb/rpm packages, ansible collections, pub archives, and raw files. A single-range request is served straight from the storage backend's native ranged read (local file seek, S3/GCS ranged GET) via a shared helper, so an interrupted `curl -C -`/pip/apt download resumes instead of restarting; a resume at end-of-file gets the RFC 9110 `416` + `Content-Range: bytes */{size}` that tells the client it already has everything (previously Docker re-served the full blob), and a failed ranged read falls back to the full 200 instead of a 500. Full-200 artifact responses advertise `Accept-Ranges: bytes`. Mutable content (maven-metadata.xml, packuments, indexes, `dists/`, `repodata/`) neither advertises nor honors ranges — a resumed range across a rewrite would splice two generations. For the same reason `raw`, the one overwritable format, honors `If-Range` against its pin ETag. A partial body cannot be re-hashed, so a ranged serve carries no server-side integrity check (the #657 precedent — the client's own lockfile/checksum covers it), and on formats where the digest-quarantine gate needs the whole object a range request under an active quarantine policy falls back to the gated full response rather than bypassing it (#893).
+- **CI builds a per-PR test image** — every non-fork PR now pushes `ghcr.io/getnora-io/nora:pr-<number>` (alpine, amd64) after the `test` job passes, and auto-comments the `docker pull` / `docker run` command on the PR so reviewers can test without building locally. Fork PRs are skipped (no `packages:write` token) (#908).
+- **Per-PR test images are now garbage-collected** — a `pr-image-cleanup` workflow deletes `pr-<number>` from GHCR when its PR closes, plus a daily sweep removes any `pr-*` orphan older than 7 days (GHCR has no native tag TTL) (#910).
+
+### Fixed
+- **Maven keeps server-generated artifact metadata authoritative** — a Maven client that re-uploads a stale artifact-level `maven-metadata.xml` after a concurrent deploy no longer overwrites the version list NORA generates: an uploaded artifact-level metadata document (and its checksums) is recognized by its shape and dropped, while version-level (SNAPSHOT) and group-level (plugin) metadata are still stored verbatim. On a proxy refresh, locally hosted versions are merged into the refreshed upstream document instead of being replaced by it, and the `.md5`/`.sha1`/`.sha256`/`.sha512` sidecars are recomputed from the merged document. The proxy-side merge runs under the same `publish_lock` as the upload-side regeneration, so the document and its checksums are written as one critical section and stay mutually consistent under concurrent fetch and publish (#887).
+- **Docker returns OCI-conformant 429 for concurrent-upload limit** — `POST /v2/{name}/blobs/uploads/` now returns an OCI `TOOMANYREQUESTS` error body with `Retry-After` header when the concurrent-upload ceiling is reached, instead of a plain status code that some clients could not parse (#895).
+- **Object-store timeouts sized for client-paced streaming** — `put` and `get` operations on the object-store backend now use timeouts proportional to the expected transfer size, so large blob uploads on slow links no longer time out spuriously (#894).
+- **Cancelling a blob upload frees the session instead of leaking it** — `DELETE /v2/{name}/blobs/uploads/{uuid}`, the OCI cancel verb, was never routed: the upload dispatcher matched only `PATCH` and `PUT`, so a client that correctly cancelled got `405 Method Not Allowed` and its session stayed in the map until the 30-minute TTL, still holding one of `max_upload_sessions`. `DELETE` now removes the session and its temp file and answers `204 No Content`. Two supporting fixes: a rejected `POST` no longer leaves behind the zero-byte temp file, and the `429`'s `Retry-After` is jittered over 3–10 s (#897).
+- **npm self-prime metadata on tarball download** — `ensure_npm_metadata_cached` fetches and caches the packument on a tarball cache-miss so `trust_upstream_dates` matures old npm artifacts correctly; includes `is_internal_namespace` guard (#68) (#903).
+- **PyPI internal bookkeeping files excluded from simple index and downloads** — `dates.json` (used by `trust_upstream_dates` quarantine) was leaking into PEP 503/691 package listings and was directly downloadable; strict clients like `uv` require hashes on every file entry, causing parse failures. Both listing and download paths now filter via `is_valid_pypi_filename()` (#891).
+- **PyPI `ensure_pypi_dates_cached` no longer leaks internal package names upstream** — the function was missing the `is_internal_namespace` guard that Cargo and npm already had, causing internal-namespace package names to be sent to external upstream registries (#68 dependency confusion surface) (#905).
+- **Conan v1/ping route added** — Conan 2.x client hard-codes `GET /v1/ping` in `ClientV2Router.ping()` before any v2 API calls; the missing route returned 404, causing the client to refuse further interaction (#901).
+- **Docker fails closed on transient storage errors in manifest reads** — a transient storage error during manifest GET now returns 500 instead of 404, preventing clients from interpreting a storage hiccup as a missing manifest (#911).
+- **Atomic token-file writes; store errors answer 503, not 401** — token CRUD operations use atomic file writes (write-to-temp + rename), and a storage I/O error during token validation now returns `503 Service Unavailable` instead of `401 Unauthorized` which would cause clients to discard valid credentials (#912).
+- **Retention and GC unified into one scheduler** — retention and GC no longer race for the cleanup lock; a single scheduler runs retention first, then GC, so retention actually executes instead of being starved by GC (#914).
+
+### Performance
+- **rpm/deb index-rebuild sidecars read concurrently** — sidecar files are read in parallel during index regeneration, reducing rebuild time on repositories with many packages (#913).
+
+### Security
+- **h2 updated 0.4.13 → 0.4.17** — addresses RUSTSEC-2026-0258 (#916).
+
+### Docs
+- **README: expanded supported registries table and fixed legend link** (#900).
+- **Documented `docker_anon_pull` in env example and llms.txt** (#899).
+
+## [1.1.0] - 2026-07-26
+
+### Fixed
+- **Ansible collections with more than 100 versions now install through the proxy** — `ansible-galaxy` pages a collection's version list at `limit=100`, and galaxy_ng returns the `links.next`/`first`/`last` pagination pointers as *host-relative* paths (`/api/v3/plugin/…/versions/?offset=100`, no scheme or host). The metadata URL rewriter only rewrote absolute upstream URLs, so those relative links passed through untouched; `ansible-galaxy` then resolved them against NORA's host root, dropping the `/ansible` mount prefix, and every request for page 2+ 404'd — surfacing as `Error when getting available collection versions for <ns>.<name> … (HTTP Code: 404)` (e.g. `community.docker`, 148 versions). The rewriter now also maps the root-relative pulp paths to root-relative NORA paths (`/api/v3/plugin/…/index/` → `/ansible/v3/collections/`, `…/artifacts/` → `/ansible/download/`), kept path-only so the client's relative-link resolution keeps the mount. Collections with ≤100 versions never paginated and were unaffected.
+- **Retention and GC schedulers run once at boot** — both schedulers used to wait a full interval before their first pass, so a process restarting more often than the interval (rolling deployments, crash loops) never ran either of them, accumulating unbounded garbage while the schedule looked configured. The interval's first tick now fires immediately, and the boot pass waits on the shared cleanup lock (instead of skip-if-held) so retention and GC don't race each other out of their first run.
+- **Cargo sparse index now advertises `auth-required` on private deployments** — with auth enabled and `anonymous_read` off, `/cargo/index/config.json` sets `"auth-required": true` (RFC 3139) so cargo sends credentials on index and download requests. Previously cargo only authenticated the publish API, and every sparse-index fetch against a private instance failed with 401 before publish even started.
+- **Scoped npm packages round-trip on S3 / object_store backends** — `encode_object_key` percent-encodes `@`→`%40` for the storage key, but `object_store::path::Path::from` then treats that key as a to-be-encoded path and percent-encodes the `%` again to `%2540` (its `INVALID` set includes `%`, not `@`). On read-back the key never decoded, so a scoped package's `list`+`get` found nothing and `regenerate_packument` wrote an **empty** `versions` map — `npm install @scope/pkg` failed with `No matching version found` / `ENOVERSIONS` even though every version tarball was stored intact. `decode_object_key` now reverses the double-encoding (`%2540`→`@` before `%40`→`@`), and publish fails closed (500, nothing committed) if the just-published version isn't visible in the packument it regenerated. The local-filesystem backend never double-encoded and was unaffected; reproduced on MinIO, SeaweedFS, RustFS and Garage.
+- **Docker serves locally-pushed manifests without upstream revalidation** — a manifest pushed to a proxy-enabled repository is now served from local storage directly, instead of being revalidated against (and shadowed by a 404 from) the upstream.
+- **`registries.enable` back-propagates to the per-registry flags** — setting the consolidated `registries.enable` list now flips each named format's own `enabled` flag, so enabling rpm/deb through it no longer leaves those routes returning 404.
+- **Object-store reachability cache self-expires on a stalled refresh** — the cached reachability verdict is now treated as stale past a max age even if the background refresh loop stops advancing it, so a wedged refresher can't pin health to a permanently-stale answer.
+- **`/health` and `/ready` no longer probe object storage** — the liveness/readiness endpoints answer from process state instead of issuing an object-store round-trip per probe, so a slow or throttled backend can't turn a health check into a failed probe.
+
+### Added
+- **Pull-through proxy and offline mirror for rpm and deb** — the last two hosted-only formats gain the proxy mode every other format has. A repository name maps to a single upstream repo (`[rpm.proxies] fedora = "https://dl.fedoraproject.org/…/os"`, `[deb.proxies] debian = "https://deb.debian.org/debian"`, string or `{ url, auth }`; `NORA_{RPM,DEB}_PROXIES="repo=url|auth,…"`) — per-repo rather than a flat upstream list because rpm/deb have no global coordinate space, and exactly one upstream per repo because mirrors of the same distro repo lag each other and mixing them within a TTL window can serve a repomd.xml whose referenced blobs belong to a different sync generation. A proxied repo is read-only (publish/delete/reindex → 409); upstream metadata — `repodata/`, `dists/` indexes, and the upstream's own signatures and keys — is served verbatim within `metadata_ttl` seconds (default 300, non-positive revalidates every pull, `Cache-Control: no-cache` to clients), packages (`.rpm`/`.drpm`, `.deb`/`.udeb`) are cached immutably, and when the upstream is down the stale cache is served with `x-nora-stale: true`. The proxy path reuses the shared machinery: circuit breaker, upstream-hostname leak detection, cache-hit/miss metrics, and the digest quarantine (`[curation.rpm]` / `[curation.deb]` overriding the global `curation.quarantine`) gating packages — never the mutable indexes. For air-gapped clients, `nora mirror rpm --repo <name> [--arch x86_64,noarch]` and `nora mirror deb --repo <name> [--dist bookworm] [--component main] [--arch amd64]` enumerate the upstream package list *through* the proxy (repomd.xml → primary.xml; Release → Packages, `.gz`/`.xz`/plain) and pre-fetch every package, skipping what the cache already holds — after a run, dnf/apt clients work with the upstream unreachable.
+- **Retention over rpm, deb, and raw** — the three formats retention previously skipped silently. rpm/deb versions are collected from the metadata sidecars (payloads never read) and grouped per `{repo}/{arch}/{package}` — structured-layout deb packages per `{repo}/{distribution}/{component}/{arch}/{package}`, so `keep_last` counts within each distribution × architecture's independent index (`all`/`noarch` packages form their own group); deleting a version removes the package and its sidecar, and every touched repo's indexes are rebuilt **and re-signed** under the publish lock afterwards — retention can no longer leave a signed index advertising deleted packages. Raw groups depth-2 path prefixes (`raw/{name}/{version}/…`) as the aging unit, so a directory of related files ages out together; root-level files are never collected. New optional `name_glob` on retention rules targets groups within a registry (e.g. `*-dev-*/*` for an age-only policy on dev repositories, `*-stream-*/*` for a keep-last window) — first matching rule wins, and no matching rule still means keep forever. `nora retention-apply --yes` signs regenerated indexes with the same key as the server.
+- **Per-rule namespace scope for OIDC role rules** — an `[[auth.oidc.providers.role_rules]]` entry may set `namespace_scope = ["ci-transport/**"]` to narrow the provider's scope for identities matched by that rule. A write must satisfy **both** the provider scope and the rule scope — the provider scope stays a hard ceiling, and a rule cannot widen past it. Lets one issuer grant, e.g., pull-request CI builds write access confined to a transport prefix while main/tag builds keep the provider-wide scope. Absent = inherit the provider's `namespace_scope`; enforcement mode stays provider-level. Also corrects the config doc example for `role_rules`, which showed a map form that fails to parse (the real shape is an array of tables with `pattern`/`role`).
+- **Intra-segment `*` wildcards in `namespace_scope`** — scope patterns now match a `*` within a single path segment (e.g. `team-*/ci`), not only the `**` cross-segment form, so a scope can target a naming convention inside one level without opening the whole subtree.
+- **A geo/policy-blocked upstream is now observable** — when a proxied upstream answers a fetch with a 4xx carrying a policy/geo block signature (`x-amzn-waf-reason`, as an AWS CloudFront + WAF geo-block does), NORA emits a `warn` log naming the registry and reason and increments `nora_upstream_policy_blocked_total{registry,reason}`, instead of relaying an anonymous 404 indistinguishable from a genuinely absent artifact. The relayed 404 status and the circuit breaker are deliberately unchanged — a policy block is not an availability failure, so it must not trip the breaker — but it is no longer silent.
+
+## [1.0.1] - 2026-07-13
+
+### Security
+- **The browse web UI is now gated on a private deployment.** With auth enabled and `anonymous_read` off, the UI, its JSON API (`/ui`, `/api/ui`), and the API docs (`/api-docs`) were served without authentication — enumerating every repository and package a private registry exists to hide. They now require credentials unless `anonymous_read` (which already exposes the same names through the registry read APIs) or the new `auth.public_web_ui` (`NORA_AUTH_PUBLIC_WEB_UI`, default false) opens them; an unauthenticated request gets a Basic challenge so browsers prompt. Health/readiness probes stay unconditionally public. `/metrics` gets its own `auth.public_metrics` (`NORA_AUTH_PUBLIC_METRICS`, default **true** — scrapers rarely carry credentials and labels name registry formats, not repositories); set it false to gate metrics too. **Behavior change:** operators who relied on an anonymous web UI while keeping the registry APIs authenticated must set `public_web_ui = true` (or enable `anonymous_read`).
+
+### Added
+- **Structured apt repository layout (`dists/{distribution}/{component}`)** — deb repositories can now publish the canonical suite layout in addition to (or instead of) the flat one, chosen per package at upload: `PUT /deb/{repo}/{path}?distribution=jammy&component=main` (component defaults to `main`) places the package under `dists/jammy/`, with per-distribution `Release`/`InRelease`/`Release.gpg` and `{component}/binary-{arch}/Packages{,.gz}` generated per component×architecture (empty combinations included, so a Release never references a missing index; arch-`all` packages fold into every concrete architecture). The upload path stays free-form — `Filename:` entries are repo-root-relative, so a `pool/` tree is conventional, not required. Uploads without `distribution` keep the existing flat behavior, both layouts can coexist in one repository, and deleting the last package of a distribution removes its whole `dists/` tree (stale signed indexes would otherwise keep advertising it). Sources line: `deb [signed-by=…] {url}/deb/{repo} jammy main`. Verified end-to-end against apt on Debian: update, install from two components, and hard rejection of an unverifiable InRelease.
+- **rpm/deb repository reconcile (`POST /{rpm,deb}/{repo}/-/reindex`)** — heals a repository whose storage changed behind the API's back (filesystem-is-the-database, ADR-2): sidecars whose package is gone are dropped, packages with no sidecar are parsed and adopted (same validation as the upload path — an invalid file fails the reconcile with 422 rather than being silently skipped), and the repo's indexes are rebuilt and re-signed under the publish lock. Returns JSON counts. Also serves as the re-sign hook after a signing-key change: reindex every repo and clients verify against the new key. The index regeneration internals are now callable without request state, groundwork for retention over rpm/deb.
+- **Native Google Cloud Storage backend (`storage.mode = "gcs"`)** — previously GCS was reachable only through its S3-interoperability layer with static HMAC keys. The S3 backend is generalized into an `ObjectStorage` over the `object_store` trait (the S3 path is unchanged) plus a GCS constructor: bucket from `storage.bucket`, credentials resolved as explicit service-account JSON (`storage.gcs_service_account_path` / `NORA_STORAGE_GCS_SERVICE_ACCOUNT_PATH`), then ambient `GOOGLE_*` env, then the instance metadata server — so GKE Workload Identity and GCE service accounts work with no key material. `storage.gcs_base_url` overrides the endpoint for emulators or Private Google Access (an `http://` override also skips request signing). `NORA_STORAGE_MODE=gcs`; `nora migrate` accepts `gcs` as source/destination. Same single-writer caveat as S3 for rpm/deb publishing. Verified end-to-end against real GCS: dnf and apt both install from a GCS-backed instance (#128 follow-on).
+- **Streaming raw uploads** — `PUT /raw/{path}` no longer buffers the request body in memory: the body streams frame-by-frame to a temp file on the storage filesystem (O(frame) peak RAM), is hashed for the integrity pin, and commits via `put_from_path` — a same-filesystem rename on the local backend, a streaming multipart write on object stores. `raw.max_file_size` is enforced incrementally as frames arrive (plus a fast reject on an oversized declared `Content-Length`), so it now governs uploads of any size independent of `server.body_limit_mb`, which no longer applies to raw uploads. Conditional PUT semantics (`If-Match`/`If-None-Match`, ETag, immutability) are unchanged; a crashed or aborted upload leaves no temp file (RAII cleanup, verified in tests). The Docker blob-upload streaming helpers moved to shared registry code and Docker's digest verification reuses the shared file-hash path.
+
+## [1.0.0] - 2026-07-13
+
+### Added
+- **`nora import` — one-shot migration from Artifactory & Nexus** — a stateless CLI (`nora import assess` / `nora import run`) that pulls repos + artifacts straight into NORA storage over HTTP, filesystem-resumable, as a single static binary with no mandatory runtime dependency. Forward-only source adapters (Artifactory AQL, Nexus continuation-token); each artifact streams through the proxy pipeline (peak RAM O(chunk)) with verify-before-commit fail-closed on checksum mismatch, full curation applied, and atomic commit — imported keys reuse the handlers' own key format so GC/retention/UI see them. Resume is an on-disk `.done` marker + NDJSON journal (no DB, ADR-2); reruns are idempotent. SSRF-guarded client (DNS-pinning, per-redirect-hop IP deny-check; blocks loopback/private/link-local/CGNAT/metadata incl. v4-mapped and NAT64). Optional `--with-permissions` emits an inert permission-proposal report (never live credentials, never above Read without `--grant-write`). On an S3 target the sha256 pin is not recorded — a loud WARN flags transfer-integrity-only, not at-rest. Full phased batch migration (#172) tracked post-1.0. (#599)
+- **GPG-signed rpm/deb repository indexes** — closes the `[trusted=yes]` / `gpgcheck=0` gap (#128). A per-instance OpenPGP key (v4 Ed25519, the variant every deployed gpgv/gnupg verifier understands) is generated at first boot and persisted under `<storage.path>/.signing/nora.key` (owner-only, atomic write; `signing.key_path` / `NORA_SIGNING_KEY_PATH` overrides — required for S3 storage, where signing is otherwise disabled with a warning). Every repodata/index regeneration also writes `repodata/repomd.xml.asc` (rpm) and `InRelease` + `Release.gpg` (deb), fail-closed and ordered after the files they sign; public keys are served at `repodata/repomd.xml.key` and `pubkey.gpg`. Turning signing off removes stale signatures on the next regeneration (a mismatched leftover would hard-fail clients), and a present-but-corrupt key is a fatal startup error — never silently rotated. Verified end-to-end with verification enforced: dnf `repo_gpgcheck=1` (Fedora 41) and apt `signed-by` (Debian 12) both install and hard-reject a wrong key. `signing.enabled = false` restores the previous unsigned behavior.
+- **RPM registry (yum/dnf, hosted)** — 14th format at `/rpm/`. Each `/rpm/{repo}/` is an independent hosted repository: `PUT {repo}/{name}.rpm` parses the package header server-side (pure-Rust `rpm` crate) and regenerates `repodata/` (repomd.xml + sha256-named primary/filelists/other.xml.gz); `DELETE` regenerates. Rebuilds run under the per-repo publish lock, fail closed, and prune unreferenced repodata generations. Repodata is unsigned — clients set `gpgcheck=0 repo_gpgcheck=0`; GPG signing is tracked in #128. Default-disabled (`NORA_RPM_ENABLED=true`), hosted-only. Verified end-to-end against dnf on Fedora 41 (#128).
+- **Debian/APT registry (hosted flat repos)** — 15th format at `/deb/`. Each `/deb/{repo}/` is an independent flat repository (`deb [trusted=yes] {url}/deb/{repo} ./`): `PUT {repo}/{name}.deb` parses the control paragraph server-side (ar → control.tar.{,gz,xz,zst}; pure-Rust `ar`/`lzma-rs`/`ruzstd`, decompression bounded) and regenerates `Packages`, `Packages.gz`, and `Release`; `DELETE` regenerates. Rebuilds read per-package control sidecars under the per-repo publish lock and fail closed. Indexes are unsigned — clients use `[trusted=yes]`; GPG signing is tracked in #128. Default-disabled (`NORA_DEB_ENABLED=true`), hosted-only. Verified end-to-end against apt on Debian (#128).
+- **Namespace-isolation refusals observable in Prometheus** — cross-namespace internal-artifact refusals are counted as a labeled metric for alerting (#821 follow-up, #823).
+
+### Fixed
+- **Token storage under systemd** — the relative default token-store path escaped the systemd sandbox and failed to persist; it now resolves correctly under a hardened unit (#818).
+- **Bounded memory on large blob uploads** — Docker blob uploads stream to disk instead of buffering the whole layer, bounding peak RAM on large images (#819).
+- **Isolated-namespace Docker miss returns 404, not 403** — a manifest/blob miss in an internal namespace no longer leaks existence via a 403 (#821, #822).
+- **Upstream URL scrubbed from ansible/nuget rewrites** — slash-escaped upstream URLs are stripped so proxied Ansible/NuGet responses don't leak the origin (air-gap hygiene) (#385, #824).
+- **UI** — corrected Russian labels and a zero-dependencies footer note (#820).
+
+## [0.9.7] - 2026-07-05
+
+### Added
+- **Admin-gated admin-token minting (`POST /api/v1/admin/tokens`)** — a dedicated route, reachable only behind the `/api/v1/admin/` gate (`auth::is_admin_path`), that mints an API token of any role including `admin` for a given subject without the `auth.admin_users` self-service check. Anonymous, `anonymous_read`, Basic-auth (no role) and Read/Write callers are denied fail-closed before the handler; `ttl_days = 0` is rejected and every mint is audit-logged (actor, target, role, ttl — never the token). `auth.admin_users` (`NORA_AUTH_ADMIN_USERS`) thus becomes a bootstrap-only fallback on the unchanged public `POST /api/tokens` route, so GHSA-78cx-cfhm-rgmx stays closed; with auth disabled the route returns `503` (#746, #808).
+- **`npm audit` proxied to upstream for remote repos** — `npm audit` POSTs to `/-/npm/v1/security/advisories/bulk` (npm7) or `/-/npm/v1/security/audits/quick` (npm6), which previously hit the `405` fallback and failed. NORA keeps no advisory database, so for a proxy repo it now forwards the request to the configured upstream and returns the response verbatim. Both audit POSTs are read-eligible under `auth.anonymous_read`, so anonymous `npm audit` works wherever anonymous install does; non-audit npm POSTs stay gated. Under an active `internal_namespaces` filter the `bulk` request strips internal-package keys before forwarding and fail-closes (`200 {}`) on any body it cannot verify, the gzipped `quick` lockfile is refused wholesale, the client `Authorization` is never forwarded, and the body is bounded at 8 MB; upstream 5xx/network → `502`, circuit-open → `503`, no proxy configured → `200 {}` (#597, #805).
+- **S3 virtual-hosted-style addressing (`storage.s3_virtual_hosted`, `NORA_STORAGE_S3_VIRTUAL_HOSTED`)** — some S3-compatible providers reject signed path-style requests (Alibaba Cloud OSS answers `403 SecondLevelDomainForbidden`), which made the S3 backend unusable there because the addressing style was hardcoded to path-style. A new default-off toggle threads through `Storage::new_s3` / `S3Storage::new` into `AmazonS3Builder::with_virtual_hosted_style_request`; when enabled, `object_store` uses the configured endpoint verbatim, so it must include the bucket host. Default (`false`) preserves current path-style behavior (#795, #798).
+- **Chinese (Simplified) UI translation** — a `中文` entry in the language switcher backed by a full `zh` translation table; language detection now normalizes BCP-47 / POSIX tags to their primary subtag, so `zh-CN`, `zh-Hans` and `ru_RU.UTF-8` resolve correctly (#788).
+
+### Fixed
+- **Terraform Provider Network Mirror Protocol** — NORA served only the Terraform Registry Protocol, but its own docs told users to configure `network_mirror`, which speaks the separate Provider Network Mirror Protocol, so every `terraform init` returned `404 "provider … not found in any of the search locations"`. Two mirror endpoints (`GET /terraform/{hostname}/{ns}/{type}/index.json` and `…/{version}.json`) are added as thin adapters over the existing registry-protocol handlers; `{version}.json` runs `check_download` (curation/blocklist parity) and namespace isolation, archive URLs route through NORA's cached/quarantined binary download, per-platform metadata is fetched concurrently, and hashes are `zh:<sha256>` from upstream metadata, fail-closed (a platform with no resolvable shasum is omitted, never served unhashed). The single configured upstream and mirror-mode integrity (Terraform skips origin GPG in mirror mode; NORA does not verify `SHA256SUMS.sig`) are documented as accepted limitations in `COMPAT.md` (#801, #802).
+
+### Security
+- **bcrypt `0.19.0` → `0.19.2` (RUSTSEC-2026-0199)** — `bcrypt::verify()` could panic on a 60-byte hash string carrying multi-byte UTF-8 at certain positions (DoS). NORA calls it in `auth/htpasswd.rs` with an operator-controlled hash (not wire-reachable), but the bump clears the advisory repo-wide; lockfile-only (#803).
+- **quick-xml `<0.41` DoS advisories (RUSTSEC-2026-0194/-0195) accepted** — transitive via `object_store` (S3 XML parsing); no `object_store` release resolves it yet. Exposure is low (XML comes from the operator-configured S3 backend, not attacker input), so both are ignored in `cargo-audit` and `cargo-deny` with the upgrade path tracked in #799 (#800).
+
+## [0.9.6] - 2026-06-27
+
+### Added
+- **Anonymous Docker pull (`auth.docker_anon_pull`, `NORA_AUTH_DOCKER_ANON_PULL`)** — a dedicated, default-off switch that serves `docker pull` without `docker login`. With auth enabled, an anonymous `GET /v2/` returns a `401` Basic challenge (so `docker login` works); under `anonymous_read = true` the manifest/blob reads themselves were served anonymously, but the `/v2/` ping still challenged. Whether a logged-out `docker pull` then succeeded depended on the client's image store: Docker's **containerd** image store tolerated the `/v2/` challenge and pulled anonymously, while the **classic** docker/distribution store cached the Basic challenge and aborted with `no basic auth credentials` (#778). When `docker_anon_pull = true`, the `/v2/` ping returns `200` so anonymous pull works **uniformly for both stores**, and manifest/blob/tag reads are served without auth; writes (push/delete) still require a token, `/v2/_catalog` stays authenticated (no anonymous repository enumeration), and a request that carries an `Authorization` header is still validated (so `docker login -u token -p <nra_…>` and audit attribution keep working). The switch is independent of `anonymous_read`, so serving Maven/raw/npm anonymously never exposes container images. **Behavior change:** anonymous access to Docker `/v2` read endpoints is now governed solely by `docker_anon_pull`. Deployments that pulled images anonymously under `anonymous_read = true` (containerd image store) must set `docker_anon_pull = true` to keep that working. Clients built on `containers/image` (skopeo/podman/buildah) read auth parameters only from the `/v2/` ping, so their *authenticated* operations degrade while the switch is on — keep it off if you need both anonymous pull and authenticated operations for those clients (#778).
+- **Upstream circuit-breaker state in `/health`** — the `/health` response gains an `upstreams` section, one entry per enabled proxy registry, so operators without Prometheus/Grafana can see which upstreams are reachable (previously this was only on the `nora_circuit_breaker_state` gauge). Each entry reports `status` — `closed` / `open` / `half_open` (mirroring the gauge labels), or `disabled` when the circuit-breaker feature is off (the default) — plus `failure_count` and `last_failure_seconds_ago`. The state is read from the breaker's cached in-memory snapshot, so `/health` never performs a live upstream probe and stays fast and non-blocking; an enabled registry with no recorded breaker yet defaults to a healthy `closed`. The OpenAPI `HealthResponse` schema is updated to match (#773).
+
+### Fixed
+- **A present-but-empty `[<registry>]` table now keeps the default upstream** — npm/pypi `proxy` and maven/docker `proxies`/`upstreams` used a bare `#[serde(default)]` that deserialized to `None`/`[]`, diverging from the `Default` impl's real upstream. Writing `[npm]` (or `[pypi]`/`[maven]`/`[docker]`) in `config.toml` to set, say, a timeout — without restating the proxy key — silently disabled proxying for that registry, while omitting the table entirely kept the upstream. The serde field-default is now single-sourced with the `Default` impl, and a guard test asserts this for every registry section so the class cannot recur. **Behavior change:** if you relied on a present-but-proxy-less table to run a registry local-only (air-gapped), set the proxy env var to empty instead — `NORA_NPM_PROXY=""`, `NORA_PYPI_PROXY=""`, `NORA_MAVEN_PROXIES=""`, `NORA_DOCKER_PROXIES=""`.
+- **Docker is now counted in the proxy and quarantine config guards** — two hand-rolled per-registry checks in config validation (the `min_release_age`-needs-quarantine guard and the "any quarantine active" check) enumerated registries by hand and omitted Docker. A Docker-only proxy with `min_release_age` and no quarantine was not flagged, and a Docker-only `[curation.docker] quarantine` was validated incorrectly. Both now derive from a single compiler-exhaustive match over the registry set, so no registry can be silently dropped again (#765).
+- **`cargo publish` against the Cargo registry no longer 404s** — the sparse-index `config.json` advertised its `api` base as `{base}/cargo/api`. Cargo appends `/api/v1/...` to that base, so publish requests went to `/cargo/api/api/v1/crates/new` and returned `404`. The advertised `api` base is now the registry mount (`{base}/cargo`), so Cargo builds `/cargo/api/v1/crates/new` and resolves to the mounted route; tests cover both the metadata and publish routes derived from the `config.json` api base (#783).
+
+### Security
+- **A per-registry-only quarantine now loads its durable store** — the digest-quarantine store was loaded only when the *global* `curation.quarantine` was set. A Docker-only `[curation.docker] quarantine` got an empty (non-durable) store: after a restart the on-disk first-seen records were ignored, so a still-young, already-cached digest was served before its hold expired. The store now loads whenever any quarantine — global or per-registry — is active (#765). **Behavior change:** an explicit global `curation.quarantine = "off"` no longer loads the store (it has no effect to enforce); set a real mode (`observe`/`enforce`) where you want enforcement.
+
+### Performance
+- **Index rebuild drops the per-key `stat()`** — rebuild walked `storage.list()` and then issued a separate `storage.stat()` per key for size/mtime; on S3 that `stat()` is a HEAD, so rebuilding N objects cost 1 LIST + N HEADs, all under the per-registry rebuild lock — the first reader after an invalidation blocked for the whole serialized round-trip. A new additive `StorageBackend::list_with_meta()` reuses the size/mtime the directory walk (local) or LIST response (S3) already carries, so the rebuild pays zero extra HEADs. The default trait impl falls back to `list()` + per-key `stat()`, so every other backend stays correct, and gc/retention/backup/mirror keep using `list()` unchanged; a counting-backend test asserts the rebuild makes zero per-key `stat()` calls (#759).
+
+## [0.9.5] - 2026-06-19
+
+### Security
+- **First-seen digest-quarantine generalized to every proxy registry** — the unspoofable first-seen cooldown (previously Docker-only) now guards all 11 proxy registries (npm, PyPI, Cargo, Go, Maven, RubyGems, NuGet, Conan, pub.dev, Terraform, Ansible). `min_release_age` on a proxy path now defers to quarantine, because upstream publish dates are unsigned and several registries expose none. **Breaking:** enabling `min_release_age` on an enabled proxy now requires an active quarantine (or `server.trust_upstream_dates` where a real upstream date is available); a min-age-only proxy policy is rejected at startup (#741, #742).
+- **Release-age freshness honored with `trust_upstream_dates` (#748)** — under #742, `min_release_age` defers to quarantine, which holds on NORA's own clock, so a provably-old artifact was held as "new to this mirror" regardless of its release date. When `server.trust_upstream_dates` is set and the registry supplies a date, the quarantine now seeds first-seen from the trusted upstream release date — an artifact older than the TTL matures immediately and is served, while a fresh one is still held. Wired for every dated proxy registry: PyPI (PEP 691 / PEP 700 `upload-time`), npm, Cargo, Go, NuGet, Conan, pub.dev, Maven (Central search API), RubyGems (v1 versions API), Ansible (Galaxy `created_at`) and Terraform (registry.terraform.io `/v2` `published-at` — the standard provider protocol carries no date). Each upstream-date path is gated on `trust_upstream_dates` (spoofable, opt-in); hosted artifacts use cached-metadata mtime. The date is obtained on the artifact download path itself — Cargo self-primes `metadata.json` there (a `cargo build` resolves via the sparse index and never hits `/api/v1/crates/{name}`, so the date would otherwise never be cached), mirroring PyPI's date self-prime. Docker stays on NORA's own clock (digest-addressed, no trusted date). Internal-namespace coordinates are never sent to a hardcoded public date source (Maven Central search, registry.terraform.io `/v2`) — the date query is skipped for internal namespaces (#68/#733). Note: Maven, RubyGems and Terraform query their date source per download request (not cached like PyPI/Cargo/Ansible); this fires only under `trust_upstream_dates` and is timeout-bounded and fail-safe — caching is a tracked follow-up.
+- **Docker digest-quarantine bypass fixed (GHSA-4j4m-fchf-gr9r)** — layer/config blobs were served on every path (`Range` and full cache-hit, proxy-stored, proxy temp-file) and via `HEAD` without a quarantine check, and a local push could pre-mature a future upstream digest through the shared ledger key. Blob serves are now gated, and `record_trusted` was removed so the ledger records only proxy-fetched content (CWE-693, CWE-345).
+- **Token-management broken access control fixed (GHSA-78cx-cfhm-rgmx)** — the token-management endpoints (`/ui/tokens`, `/api/ui/tokens`, and the public `/api/tokens/revoke`) authenticated the caller but never authorized them, so any write-capable bearer/OIDC identity could enumerate and revoke other users' tokens (including admin and service tokens), and a read identity could enumerate them. List and revoke are now owner-scoped — a non-admin acts only on its own tokens, while admins still manage all — and a non-owned id returns `404` (not `403`) so a caller cannot probe which ids exist (CWE-862).
+- **Admin-token self-escalation blocked (GHSA-78cx-cfhm-rgmx)** — the public `POST /api/tokens` route minted whatever role was requested, so any htpasswd account could self-mint an `admin` token. **Breaking:** an `admin` token may now be minted via this route only by an account listed in `auth.admin_users` (`NORA_AUTH_ADMIN_USERS`), which is empty by default; read and write tokens are unaffected. If you rely on this route to create admin tokens, set `NORA_AUTH_ADMIN_USERS=<your-admin-user>` before upgrading (CWE-862).
+
+### Added
+- **Admin storage reindex** — `POST /api/v1/admin/reindex` (admin-role token only) refreshes the in-memory indexes from storage so the UI reflects artifacts copied in out-of-band (rsync, Unison, BTRFS send/receive, S3 sync) without a container restart or a dummy client pull. Optional `?registry=<name>` scopes the rebuild to one registry (unknown names return `400`); the rebuild runs in the background and the call returns `202 Accepted`. Repeated calls are debounced (`429` + `Retry-After`). The index is process-local, so under a multi-replica deployment the call refreshes only the replica that served it — reindex each replica or roll the deployment (#735).
+- **`server.trust_upstream_dates`** — opt-in flag that lets `min_release_age` use a real upstream publish date where one is cached (e.g. npm `time`), as an enhancement to — not a substitute for — quarantine (#729).
+- **npm `/-/whoami` endpoint** — token-based identity so `npm whoami` resolves against a NORA token (#720).
+- **`auth.admin_users` (`NORA_AUTH_ADMIN_USERS`)** — a comma-separated list of htpasswd usernames permitted to mint `admin`-role tokens via `POST /api/tokens`; the bootstrap for admin designation (GHSA-78cx-cfhm-rgmx).
+
+### Fixed
+- **Index rebuild no longer caches a failed storage scan as a fresh empty result** — if the storage listing errored mid-rebuild, the index was cached empty *and* clean, so the UI could report zero artifacts on healthy data until the next write. A failed scan now leaves the index dirty and retries on the next read (#735).
+- **Partial `config.toml`** — missing `[server]`, `[storage]`, or fields like `host`/`port` no longer prevent startup; serde defaults are applied for all unset values.
+- **Container image no longer overrides `config.toml`** — the image shipped config *values* (`NORA_PUBLIC_URL`, `NORA_PORT`, `NORA_STORAGE_PATH`, `NORA_AUTH_TOKEN_STORAGE`) as baked `ENV`, which silently won over a user-provided `config.toml` (env has the highest precedence in `Config::load`). Defaults now ship as a file (`/etc/nora/config.toml`, loaded via `NORA_CONFIG_PATH`); a bind-mounted `config.toml` takes full effect. Only `NORA_HOST` stays in `ENV` so binding survives a partial mounted config and the container stays reachable (#719).
+- **Namespace isolation now covers every proxy registry's metadata path** — `internal_namespaces` (the dependency-confusion defense, always active) previously gated only the download/tarball path, so a metadata / index / version-list / search request for an internal-namespace package leaked its name upstream on every proxy registry except npm. The guard now runs on the metadata path of PyPI, Cargo, Maven, Go, NuGet, Conan, pub.dev, Terraform, Ansible and RubyGems — and on the NuGet/Conan search query — serving any locally-published or cached copy first and blocking only the genuine upstream fetch (no leak, and no false 403 on a locally-published internal package). The npm TTL-stale metadata refetch is also guarded, closing a residual of #725 (contrib-kit#68).
+- **Locally-published internal packages are served instead of being blocked** — `internal_namespaces` is documented as "never proxied *upstream*", but `check_download` ran the always-on namespace filter *before* the local serve, so a mixed proxy+host instance returned 403 for its **own** internal packages on every download path (npm, PyPI, Cargo, Maven, Conan, RubyGems, NuGet, pub.dev, Go, Ansible, Docker, raw) and on the NuGet `registration_index`, pub.dev `package_listing` and RubyGems `compact_index` metadata paths. An internal name now serves any local/cached copy first and blocks only the genuine upstream fetch; an internal name with no local copy is still blocked and never proxied. Non-internal behavior is unchanged (#733).
+- **Enforce mode requires at least one active control** — `curation.mode = enforce` no longer hard-requires `allowlist_path`; a blocklist-only, min-release-age-only, or quarantine-only policy is valid, and enforce is rejected only when no control of any kind is configured (#740).
+- **Basic-auth accepts an API token as the password** — clients sending an API token over HTTP Basic auth (`user:<token>`) are now authenticated, matching the token-in-header behavior (#737).
+- **Crash durability** — the parent directory is `fsync`'d after the atomic rename, so a published artifact survives a power loss immediately after write (#723).
+- **npm scoped-package publish** — scoped attachment filenames (`@scope/name`) are normalized, so the tarball is stored and served under the correct key (#724).
+- **npm `whoami` response** — serialized via `serde_json` instead of `format!`, avoiding malformed output on unusual usernames (#722).
+
+## [0.9.4] - 2026-06-13
+
+### Added
+- **Multiple PyPI upstream proxies** — `NORA_PYPI_PROXIES` (or `[pypi].proxies`) configures an ordered list of upstreams. The order is the precedence — the first upstream that lists or serves a file wins, like pip's `--index-url` ahead of `--extra-index-url`; locally cached/uploaded files win over all upstreams. The mount-points table in the UI lists every configured upstream (#663, #706).
+- **Dual-stack IPv4+IPv6 bind** — the `::` wildcard now accepts both address families (`IPV6_V6ONLY` cleared via socket2), with a `0.0.0.0` fallback when IPv6 is unavailable, so the default container bind serves both (#696).
+- **Docker OCI single-POST monolithic blob upload** — `POST /v2/<name>/blobs/uploads/?digest=...` is now supported per the OCI Distribution spec (#698).
+- **Docker Range requests for blob GET** — `Range` / `206 Partial Content` enables resumable image pulls (#657).
+- **`nora healthcheck` CLI subcommand** — a dependency-free loopback probe for a Docker `HEALTHCHECK`; it ignores `HTTP_PROXY` and probes IPv4 loopback so it reaches a wildcard or `0.0.0.0` bind (#695, #701).
+- **Compile-time integrity witnesses (typestate pilot)** — served artifacts carry a type-level proof that their hash-pin was discharged at the serve site; rolled out to the buffered-serve path (#666, #674).
+- **Conditional-request revalidation for mutable/stale metadata** — Docker tags, the Cargo sparse index, Maven metadata, Go version listings, npm packuments, and Ansible / Gems / Conan / NuGet / Pub package metadata now revalidate against upstream (`If-None-Match` / TTL) before serving from cache instead of serving blindly stale (#639, #641, #643, #646, #647, #669, #670, #671, #672, #673).
+- **Single-flight upstream coalescing** — concurrent cache-miss fetches for the same artifact collapse into one upstream request (#618); npm metadata revalidates with `If-None-Match` on TTL expiry (#617).
+- **Per-registry observability** — per-registry artifact and storage gauges plus process uptime (#637), and curation allow/block decisions exposed via Prometheus (#636).
+- **Configurable token-verify cache TTL** (`NORA_AUTH_TOKEN_CACHE_TTL`) — bounds the cross-replica token-revocation window (#668).
+- **Operator re-pin recovery** — a CLI path to re-pin integrity-failed artifacts after the operator verifies them (#620).
+- **Startup safety warnings** — NORA warns loudly when running without authentication (#635) and when `public_url` is unset on a loopback bind (#591).
+- **Docker `default_action = deny`** — reject image names that match no configured upstream rule (#572).
+
+### Changed
+- **Dashboard counters are served from the Prometheus registry** instead of a separately-persisted `metrics.json` — the on-disk copy and its periodic write are gone, so the UI and `/metrics` can no longer disagree, and the figures are "since restart" (shown via a hover tooltip on the affected stat cards) (#626, #703, #706).
+- Streamed Docker blob downloads no longer buffer the full blob in RAM (#580, #589).
+- `serve-stale` behavior is aligned across all registry handlers (#576, #577).
+- Client-facing URL construction (service-index rewriting, UI install commands, `docker pull`) is centralized in `ServerConfig::public_base_url()` / `public_host()`, replacing three divergent inline copies (#594).
+- Instrumented the buffered `get()` integrity-verify cost (`nora_storage_verify_duration_seconds`) for capacity planning (#619).
+
+### Fixed
+- **Dashboard / UI** — the sidebar nav lists only enabled registries instead of all formats (#704, #705); real on-disk dashboard stats instead of virtual/double-counted figures (#621); search added to the Maven/Go browsers to match the list-page contract (#622).
+- **Reverse-proxy sub-path mounts** — UI self-links, static assets, inline `fetch` calls, redirect `Location` headers, and the API-docs / Swagger URLs are now prefixed with the path component of `public_url`; root-vhost deploys are unaffected (the prefix is empty, a no-op) (#685, #686, #690). The UI `docker pull` command uses the bare host authority, and the IPv6 fallback base URL brackets the address (`http://[::1]:4000`).
+- **PyPI** — percent-encoded filenames (e.g. `+cuXXX` wheels published as `%2B`) now match when proxying a custom index, instead of 404ing (#699).
+- **Docker** — deleting a manifest by digest also removes tags that resolve to it (#697); manifest blob references are validated and tag writes serialized on push (#656); upload temp files orphaned by a write failure are swept on the periodic sweep, not only at boot (#683, #684); the release-image `HEALTHCHECK` uses `127.0.0.1` and supports IPv6 binds (#569, #570, #573).
+- **Cargo** — the sparse-index rebuild is all-or-fail (a read error aborts instead of publishing a truncated/empty index and silently dropping versions) and regenerates from per-version entries instead of read-modify-write (#681, #682, #651).
+- **npm** — the packument is regenerated from per-version keys instead of read-modify-write (#649).
+- **Storage integrity** — `get()` fails closed on a hash-pin mismatch (#582, #600); hash-pin writes are durable and recorded before `put()` returns (#604, #613, #633); the streaming Docker-blob serve verifies the digest while streaming and aborts on tamper (#632); `health_check` write-probes the backing store instead of only checking the directory exists (#634).
+- **GC** — a grace period stops the collector deleting blobs belonging to in-flight pushes (#584, #611).
+- **Circuit breaker** — a stalled half-open probe is released instead of wedging at `503` (#585, #607); a 4xx probe recovers without masking real failures (#606, #614); probe reports are fenced by generation so a stale "lost" probe can't flip state (#667).
+- **Backup** — the archive is published durably via temp file + `fsync` + rename (#678).
+- **Observability** — the upstream-URL leak detector excludes NORA's own admin/UI/observability surface (`/api/`, `/api-docs`, `/ui`, `/health`, `/ready`, `/metrics`), counting each skip as `nora_leak_detection_skipped_total{reason="own_surface"}`, so `nora_response_upstream_url_leak_total` reflects only genuine proxy-response leaks and is alertable (#624).
+- **Secrets** — the env provider preserves `VarError` context in errors (#592).
+
+### Security
+- **Min-release-age quarantine now fails closed on an unknown publish date** — `MinReleaseAgeFilter` returned `Skip` (defer, ultimately allow) when a package's publish date could not be determined, so an artifact whose age cannot be verified bypassed the quarantine. This was the one fail-open path in an otherwise fail-closed curation engine (the config layer already rejects `on_failure = "open"`). An unknown date is now blocked when the quarantine is active for that registry (threshold > 0); a registry with the quarantine disabled (threshold `0`) still defers (#679, #680).
+- **Curation fails closed on a malformed SIGHUP policy reload** — a bad hot-reload no longer swaps in a broken engine; the active policy is kept (#586, #605).
+- **Mirror verifies content digests before pushing** — both the manifest digest and each blob's SHA-256 are verified against the requested digest before a mirrored artifact is written (#587, #608, #609, #615).
+- **OIDC `namespace_scope` is now enforced on writes** — it was previously parsed and documented as a per-provider access control but never applied at runtime (fail-open, #583). A provider's `namespace_scope` now restricts which artifact namespaces its tokens may publish to, across docker, raw, npm, maven, pypi and cargo. Matching is segment-aware (`myorg/*` matches `myorg/repo` but never `myorg-evil/...`; use `myorg/**` for everything under `myorg/`).
+  - **BREAKING (behavioral):** if a provider's `namespace_scope` is set to anything other than `["*"]`, out-of-scope writes from that issuer now return `403`. The default `["*"]` is unchanged and remains a no-op, so deployments that never set the field are unaffected. **Check your OIDC config before upgrading.**
+  - To stage the rollout, set `namespace_scope_enforcement = "audit"` on the provider: out-of-scope writes are allowed but logged and counted as `would_deny` via the new `nora_auth_namespace_scope_total{provider,decision}` metric. Switch to `"enforce"` (the default) once the metric is clean.
+  - Scope applies to OIDC identities only; opaque (`nra_`) tokens and Basic auth are unaffected. Reads are never gated.
+
+## [0.9.3] - 2026-05-30
+
+### Security
+- **Null byte rejection middleware** — new outermost layer returns 400 Bad Request for URL paths containing `\0`, `%00`, or `%2500`; previously caused 500/panic in handlers (#565)
+- **Path traversal hardening** — additional guards against `../` and symlink-based traversal (#560)
+- **Rate limit inversion fix** — rate limiter no longer inverts allow/deny logic in certain edge cases (#560)
+- **javascript: URI injection** — metadata links with `javascript:` scheme are now stripped (#522, #546)
+- **Reflected XSS in install commands** — UI install commands are now HTML-escaped (#521, #545)
+- **Invalid quarantine/curation/audit mode values rejected** — fail-closed on unknown values (#524, #548)
+- **Credential fields migrated to ProtectedString** — secrets zeroed on drop, excluded from Debug (#523, #547)
+- **Dependency update: tar 0.4.45 → 0.4.46** — fixes PAX header desynchronization (GHSA-3pv8-6f4r-ffg2)
+
+### Fixed
+- **Cargo proxy User-Agent** — set `nora/<version>` User-Agent on the shared HTTP client; crates.io returns 403 without it (#565)
+- **Docker TOCTOU race** — upload session creation now uses atomic file operations; orphaned temp files cleaned on startup (#530, #554)
+- **Docker blob HEAD check** — use `stat()` instead of full `get()` for HEAD requests; fix `Bytes` refcount on proxy clone (#526, #550)
+- **npm publish with corrupt metadata** — reject publish when existing metadata JSON is malformed (#533, #558)
+- **Terraform serve-stale** — serve cached metadata when upstream is unreachable (#532, #557)
+- **Go Cache-Control** — use `is_mutable` flag instead of `content_type` for header selection (#531, #556)
+- **S3 key roundtrip collision** — use `%40` encoding for `@` in S3 storage keys (#534, #559)
+- **GC metadata serialization** — serialize metadata cleanup with `publish_lock`, make `put()` atomic (#529, #553)
+- **StorageBackend::list()** — now returns `Result` instead of panicking on I/O error (#528, #552)
+- **Auth token cache key alignment** — insert and lookup use the same key format (#527, #551)
+- **Auth CIDR prefix=0 overflow** — handle arithmetic overflow in TrustedProxies parsing (#525, #549)
+- **Base URL wildcard host** — fail-fast on startup if host is `0.0.0.0` without `NORA_PUBLIC_URL` (#510, #511, #512)
+- **Metrics body size_hint** — leak detection guard uses `size_hint` instead of `content_length` (#517, #519)
+
+### Changed
+- **Config refactor** — `config.rs` split into per-registry config modules for maintainability (#484, #564)
+- **AppState Clone** — `AppState` now implements `Clone` for Axum `FromRef` decomposition (#483, #516)
+- **Proxy fetch newtypes** — replaced stringly-typed proxy parameters with newtypes (#482, #515)
+- **LazyLock migration** — replaced `lazy_static!` with `std::sync::LazyLock` (#373, #480, #514)
+- **LOCK-SAFE annotations** — all cache-through proxy functions annotated with lock safety guarantees (#518, #520)
+- **Rust toolchain pinned to 1.96.0** (#555)
+
+### Added
+- **Playwright E2E contract tests** — typed contracts for all 13 registry UI pages, visual regression screenshots (#565)
+- **1204 tests** (up from 1086 in v0.9.2)
+
+### Breaking
+- **`NORA_PUBLIC_URL` required** when `host=0.0.0.0` — prevents misconfigured URL rewriting. Set `NORA_PUBLIC_URL=https://your-domain.com` in your environment. (#510, #512)
+
+## [0.9.2] - 2026-05-23
+
+### Added
+- **Prometheus P0 metrics** — `nora_downloads_total`, `nora_uploads_total`, `nora_storage_bytes`, `nora_cache_requests_total`, `nora_upstream_request_duration_seconds` histogram with per-registry labels (#431, #432, #443)
+- **Grafana dashboard** — production-ready dashboard JSON in `dist/grafana-dashboard.json` with documentation (#436, #437)
+- **Ansible Galaxy v3 compliance** — pagination forwarding, artifact route alias, spec name validation (#433, #434, #438, #444, #445)
+- **.deb/.rpm packaging** — `nfpm` configuration for native Linux packages (#209, #435)
+- **Circuit breaker gauge initialization** — `nora_circuit_breaker_state` emits 0 (CLOSED) at startup for all enabled registries (#441)
+- **PyPI URL-rewrite tests** — 11 tests covering trailing-slash and double-slash regressions (#387)
+- 1086 total tests (up from 1049)
+
+### Fixed
+- **npm upstream URL leak (P0 security)** — metadata responses no longer expose `registry.npmjs.org` URLs (#439)
+- **Cargo sparse index `api` field** — `config.json` now returns correct `/cargo/api` path instead of `/cargo` (#442)
+- **PyPI trailing-slash URL rewrite** — response body URLs no longer contain double-slash `//simple` (#387)
+
+### Changed
+- Dashboard screenshot updated to v0.9.2 with populated metrics panels (#429, #430)
+- README and SECURITY.md synced with v0.9.2 (#428)
+
+## [0.9.1] - 2026-05-21
+
+### Added
+- **NuGet gzip registration** — `RegistrationsBaseUrl/3.6.0` responses compressed with gzip per NuGet V3 spec (#421)
+- **NuGet semVerLevel filtering** — search and autocomplete hide SemVer 2.0 packages when `semVerLevel` not specified (#421)
+- **NuGet service index generation** — generate service index from scratch instead of rewriting upstream, ensures all `@id` URLs point to Nora (#404, #405)
+- **NuGet Chocolatey/PowerShell aliases** — `/chocolatey/` and `/powershell/` path aliases for NuGet V3 endpoints (#412, #419)
+- **NuGet local autocomplete fallback** — autocomplete works in air-gap mode using cached package index (#414, #417)
+- **NuGet serve-stale** — serve cached metadata when upstream is unreachable, with `X-Nora-Stale` header (#409, #410, #411)
+- **NuGet deprecation/vulnerability pass-through** — registration responses preserve deprecation and vulnerability metadata from upstream (#425)
+- **Cargo ETag + HTTP 304** — sparse index responses include SHA-256 ETag; `If-None-Match` returns 304 Not Modified (#397)
+- **Upstream URL leak detection metric** — Prometheus counter `nora_upstream_url_leak_total{registry, leak_type}` fires when response bodies/headers contain upstream registry URLs (#386, #426)
+- **NuGet E2E test suite** — 11 dotnet client fixture projects covering restore, analyzers, source generators, native RID, SemVer2, version ranges, case insensitivity, lock files, deep transitive deps, and Chocolatey alias
+
+### Fixed
+- **NuGet URL rewriting** — registration index/page `@id` and `packageContent` URLs no longer leak `api.nuget.org` (#388, #392, #393, #394, #400)
+- **NuGet background fetch** — index fetch routed through `proxy_fetch_text` to respect proxy and circuit breaker settings (#413, #416)
+- **NuGet upstream URL stripping** — strip path component from upstream proxy URL to prevent double-path (#407, #408)
+- **NuGet serve_stale config** — respect `serve_stale` config flag in search/autocomplete fallback (#423)
+- **PyPI PEP 691 typed structs** — replaced ad-hoc JSON manipulation with typed Serde structs for spec conformance (#390, #398)
+- **PyPI file hash key** — renamed `digests` to `hashes` to support PEP 691 specification (#389, #399)
+- **npm scoped package tarball key** — correct tarball storage key for `@scope/package` in UI detail view (#402, #403)
+- **Air-gap URL leaks** — fixed upstream URL leaks across NuGet, Terraform, and Ansible registries (#400)
+- **Curation test serialization** — serialize env-override tests with mutex to prevent flaky parallel failures (#406)
+
+### Changed
+- **NuGet search endpoint discovery** — dynamically discover search/autocomplete endpoints from upstream service index instead of hardcoding (#370, #418)
+- **NuGet metadata proxy timeout** — reduced from default to 2s for faster fallback to cache (#415, #420)
+- **URL-leak invariant tests** — added URL-leak detection tests for NuGet and npm registries (#390, #395)
+- 1049 total tests (up from 994)
+
+## [0.9.0] - 2026-05-16
+
+### Added
+- **OIDC / Workload Identity** — zero-secret auth for GitHub Actions and GitLab CI JWT tokens (#342)
+- **Cache-Control completeness** — extend caching headers to all remaining registries (#340)
+- **Docker streaming blob uploads** — chunked upload processing eliminates OOM on large images (#368)
+- **Docker path-based upstream routing** — route pulls to specific upstreams by image path prefix (#365)
+- **Docker metadata TTL + stale-while-error** — cached manifests revalidate against upstream after configurable TTL; serve stale on upstream failure (#311)
+- **Docker/OCI mirror namespacing** — per-upstream namespace prefix isolates storage keys, with lazy migration from legacy flat layout (#323)
+- **Per-registry circuit breaker overrides** — `[circuit_breaker.overrides."registry:url"]` allows custom thresholds per upstream (#339)
+- **Streaming read_timeout for Docker blobs** — per-chunk timeout prevents stuck connections on large layer downloads (#341)
+- **Hot reload for curation policy** — SIGHUP reloads blocklist/allowlist without restart using lock-free ArcSwap (#343)
+- **linux/arm64 support** — multi-platform Docker images and binary releases for ARM64 (#193)
+- **Production deployment files** — `deploy/docker-compose.prod.yml` and `deploy/nora.service` systemd unit (#307)
+
+### Changed
+- **Manifest response builder** — extracted `manifest_response()` helper, removing 3 duplicate return paths in Docker registry (#338)
+- **Env var naming convention** — shortened variables to `NORA_{SECTION}_{FIELD}` pattern (under 30 chars), e.g. `NORA_TF_*`, `NORA_CURATION_INTERNAL_NS`
+
+## [0.8.4] - 2026-05-15
+
+### Fixed
+- Add Content-Length header to `library/` fallback manifest response (#337)
+- Docker 3+ path segments (`org/team/app`) routed correctly (#309)
+- GC blob ordering — blobs deleted before manifests to prevent dangling references (#305)
+- GC graceful SIGTERM — flush pending deletions on shutdown (#306)
+- AuditLog singleton — single instance instead of duplicate per registry (#308)
+- UI mount points table shows all configured upstreams (#312)
+- Token owner set to real authenticated user instead of "admin" (#322)
+- Race conditions, non-atomic writes, and version sorting (#318, #334)
+- Log storage write failures instead of silently discarding (#317, #332)
+- Security hardening — health endpoint sanitization, auth warning, Docker realm validation (#330)
+- Security hardening — XSS protection, injection prevention, input validation (#319, #335)
+- Raw registry Cache-Control changed from `immutable` to configurable `no-cache` default (#302, #329)
+- NuGet: use shared http_client for flatcontainer index fetch (#331)
+- Catch panics in background cache tasks, consolidate Go registry spawns (#333)
+- Log audit write and serialization failures instead of swallowing (#321, #327)
+- Write `.crate` tarball before sparse index to prevent zombie versions (#316, #328)
+- Move blocking file I/O out of upload session lock scope (#313, #326)
+- Use proxy-aware client IP in token API rate limiting (#314, #325)
+- Flush token `last_used` on graceful shutdown (#304, #324)
+
+### Changed
+- README and ROADMAP synced with current state (#344)
+- Configuration reference updated with raw `cache_control` docs (#303)
+
+## [0.8.3] - 2026-05-13
+
+### Added
+- Outbound HTTP/SOCKS5 proxy support (#296)
+- Structured audit log with configurable output (#286)
+- Raw registry RFC 9110 conditional PUT (#278)
+- Raw registry POST /raw/-/reindex endpoint (#276)
+- Reverse proxy setup guide (#275)
+
+### Fixed
+- Duplicate library/ prefix block in Docker download_blob (#297, #285)
+- Security hardening: HTML escape, brute-force, realm validation (#292)
+- Warn-level log when all proxy upstreams fail (#284)
+- Log all silent storage and proxy errors (#282)
+- PyPI: merge upstream and local files in simple index (#295)
+- Flaky quarantine persistence test under tarpaulin (#299)
+- OpenAPI 429 docs, 405 with Allow header (#279)
+
+### Changed
+- 994 total tests (up from 910)
+
+## [0.8.2] - 2026-05-07
+
+### Fixed
+- **TTL race condition** — unified TTL semantics across registries; repo_index invalidation no longer races with concurrent publishes (#266)
+- **NuGet autocomplete leak** — `SearchAutocompleteService` URLs in service index now rewrite to NORA instead of leaking to `azuresearch-*.nuget.org`. New `/nuget/v3/autocomplete` proxy endpoint with graceful fallback (#262)
+- **NuGet gallery leak** — `SearchGalleryQueryService` root URLs (`azuresearch-{usnc,ussc}.nuget.org/`) now rewrite to NORA. Zero azuresearch URLs remain in service index
+- **NuGet 429 during cache warming** — registry proxy routes no longer double-limited by `general_limiter` + `upload_limiter`. Removes 429 errors during `dotnet restore` with many packages while keeping auth rate limiting active
+- **E2E test paths** — NuGet smoke tests used wrong paths (`/v3/flat/` → `/v3/flatcontainer/`, `/v3/search` → `/v3/query`)
+
+### Added
+- **NuGet search fallback** — local search from repo index when upstream is unavailable, download tracking for proxied packages (#261)
+- **Env var naming guideline** — `CONTRIBUTING.md` documents `NORA_{SECTION}_{FIELD}` pattern with abbreviation convention (`NORA_CB_*`)
+- 910 total tests (up from 909)
+
+### Changed
+- Docker base images switched to real RED OS and Astra Linux images (#260)
+- NuGet autocomplete config: env var `NORA_NUGET_AUTOCOMPLETE`, config field `autocomplete`
+
+## [0.8.1] - 2026-05-06
+
+### Fixed
+- **UI polish** — improved dashboard layout and proxy index reliability
+- **Error logging** — better error messages for proxy failures (#259)
+
+## [0.8.0] - 2026-05-02
+
+### Added
+- **Hash Pin Store** — content-addressable integrity verification for all stored artifacts, `put_if_absent()` semantics with NDJSON persistence (#229)
+- **Trusted proxy support** — `NORA_AUTH_TRUSTED_PROXIES` accepts CIDR ranges for X-Forwarded-For extraction (#230)
+- **Cache-Control headers** — proper caching directives for proxy registries: Docker, Maven, npm, Cargo, PyPI, Go, Pub, Raw (#230)
+- **Auth rate limiting** — per-IP exponential backoff on failed authentication (429+Retry-After) (#229)
+- **Docker publish_locks eviction** — automatic cleanup of stale upload locks (#230)
+- **GOVERNANCE.md and ROADMAP.md** — project governance model and public roadmap (#228)
+- **Version consistency gate** — `scripts/pre-commit-check.sh` validates Cargo.toml vs OpenAPI vs Cargo.lock versions, enforced in release pipeline (#224, #225)
+- 908 total tests (up from 851)
+
+### Fixed
+- **Docker proxy timeout** — default timeout raised from 60s/120s to 300s, large image pulls no longer time out (#233)
+- **Unicode path validation** — non-ASCII characters in Maven/Raw upload paths now return 400 instead of 500 (#234)
+- **Docker /v2/ auth** — require authentication per Docker V2 spec (#220)
+- **Curation bypass token timing** — constant-time comparison using `subtle` crate (#230)
+- **S3 paginated listing** — storage size calculation now handles >1000 objects correctly (#230)
+- **Docker temp file cleanup** — upload temp files are removed on failure (#230)
+- **OpenAPI schema deduplication** — removed 8 duplicate type definitions (#227)
+- **OpenAPI status codes** — documented 400/409/413/422/503 responses that API already returns (#235)
+
+### Changed
+- Mobile-responsive UI — dashboard grid, hidden table columns on small screens, Raw registry "Files" tab (#218)
+- Startup metric renamed to `startup_duration_ms` with Cold Start display on dashboard (#218)
+- Guardrails: semver-checks, Renovate config, pre-commit hooks, clippy deny rules (#225)
+- cargo-deny-action bumped to v2.0.17 (#231)
+
+### Security
+- Rate limiting hardening for token endpoints (#229)
+- Curation completeness checks for all registry formats (#230)
+- Raw registry glob pattern validation (#230)
+
+## [0.7.3] - 2026-05-01
+
+### Fixed
+- **Docker /v2/ auth flow** — endpoint now correctly returns 401 Unauthorized with WWW-Authenticate header when auth is enabled. Previously, Docker clients received 200 OK without authentication, causing `docker login` to appear successful while `docker pull`/`docker push` failed with "unauthorized" (#219)
+- **Raw registry curation bypass** — raw was the only registry without `check_download()`, completely bypassing curation enforce mode. All 13 registries are now curated consistently
+- **Timing side-channel on bypass token** — replaced string comparison with constant-time comparison (`subtle` crate) to prevent timing attacks
+- **Maven glob matching** — `com.evil.**` pattern now correctly matches `com.evil:lib` (colon separator for Maven groupId:artifactId)
+- **Mobile dashboard** — responsive layout with 3-column stats grid, compact padding, and word-wrap on small screens
+
+### Added
+- **Raw directory browser** — nested navigation with breadcrumbs, folder/file icons, directories-first sorting. Browse raw artifacts at any depth
+- **Docker Hub images** — NORA is now published to Docker Hub as `getnora/nora` alongside GHCR
+- **Docker-Distribution-API-Version header** — `/v2/` response now includes `registry/2.0` header per Docker Registry V2 spec
+- **Startup time metric** — `startup_duration_ms` exposed on dashboard (cold start tracking)
+- 857 tests (up from 851)
+
+## [0.7.2] - 2026-04-28
+
+### Added
+- **Publish date extraction** — curation min-release-age filter now extracts real publish dates from cached metadata for npm, PyPI, Cargo, and Go registries (#207)
+- **Per-registry curation overrides** — configure min_release_age per registry via TOML (`[curation.npm] min_release_age = "3d"`) or env (`NORA_CURATION_NPM_MIN_RELEASE_AGE`) (#205)
+- `parse_iso8601_to_unix()` helper for ISO 8601 / RFC 3339 date parsing across registry formats
+
+### Fixed
+- Raw registry: UI now updates immediately after upload/delete — added missing `repo_index.invalidate("raw")` calls (#212)
+
+### Verified
+- Token RBAC: `last_used` tracking (deferred flush), auto-expire rejection, description field — all functional (#206)
+
+## [0.7.1] - 2026-04-27
+
+### Added
+- **Min-release-age filter** — block packages younger than N days/hours/weeks (#132). Config: `min_release_age = "7d"`, env `NORA_CURATION_MIN_RELEASE_AGE`
+- **Token RBAC** — read/write/admin roles per token, expiry badges in UI, expired tokens sorted to bottom (#124)
+- **Dynamic stats footer** — demo builds show live binary size, VmRSS, registry count from /proc (replaces hardcoded values)
+- 850 total tests (up from 821)
+
+### Changed
+- Token list UI: expired tokens show red badge, sorted to bottom with reduced opacity
+- `format_expiry()` replaces `format_timestamp()` for token expiry display — correctly shows "in 28d" for future, "expired 3d ago" for past
+- `#[non_exhaustive]` on `Role` enum for forward compatibility
+
+## [0.7.0] - 2026-04-27
+
+### Added
+- **Declarative registry selection** — `[registries] enable = ["docker","npm"]` / `"all"` / `["all","-maven"]`, env `NORA_REGISTRIES_ENABLE`, 3-tier priority (env > TOML > legacy)
+- **Curation layer** — policy engine for download filtering across all 13 registries (#184-#190)
+  - Blocklist/allowlist rules with glob patterns and namespace isolation
+  - Three modes: `off` (passthrough), `audit` (log only), `enforce` (block downloads)
+  - Integrity verification via SHA256/SHA512 checksums
+  - CVE blocking via blocklist rules (manual CVE entries)
+  - CLI tools: `nora curation validate`, `nora curation explain`
+- RubyGems proxy registry (`/gems/`) — compact index, gem/gemspec immutable caching, TTL-based index refresh (#141)
+- Terraform proxy registry (`/terraform/`) — provider/module proxy with service discovery, download_url rewriting (#133)
+- Ansible Galaxy proxy registry (`/ansible/`) — Galaxy v3 API, collection tarball immutable caching (#134)
+- NuGet v3 proxy registry (`/nuget/`) — service index @id URL rewriting, .nupkg/.nuspec immutable caching (#140)
+- Pub (Dart/Flutter) proxy registry (`/pub/`) — package metadata URL rewriting, SHA256-verified archive caching (#166, based on PR #191 by @mit-73)
+- Conan V2 proxy registry (`/conan/`) — recipe/package caching with immutable revision-scoped storage, ConanCenter upstream (#142)
+- Dynamic registry loading — only enabled registries mount routes, appear in UI sidebar and health endpoint
+- Per-registry `enabled` flag in config (env: `NORA_DOCKER_ENABLED`, `NORA_MAVEN_ENABLED`, etc.)
+- Shared `RegistryType` enum for type-safe cross-module registry identification
+- UI: 13-registry sidebar with format-specific SVG icons, dashboard cards for all registries
+- Short-SHA Docker tags in CI builds (#182, #192)
+
+### Changed
+- Copyright updated to "The NORA Authors"
+- OpenAPI spec version synced with Cargo.toml
+
+## [0.6.5] - 2026-04-23
+
+### Fixed
+- UI install commands now respect `NORA_PUBLIC_URL` for all registries — PyPI, npm, Go, Raw, Docker (#177)
+- Docker `WWW-Authenticate` realm uses `NORA_PUBLIC_URL` instead of hardcoded "Nora" (#177)
+- PyPI simple index generates absolute download URLs using `NORA_PUBLIC_URL` (#177)
+
+## [0.6.4] - 2026-04-22
+
+### Fixed
+- S3 storage mode: removed Dockerfile ENV override that forced local mode regardless of config.toml (#173)
+- Audit log and dashboard metrics: create parent directories before file open (fixes crash with readOnlyRootFilesystem)
+- Security: update rustls-webpki to 0.103.13 (RUSTSEC-2026-0104)
+## [0.6.3] - 2026-04-19
+
+### Fixed
+- GC and Retention schedulers now share a cleanup lock preventing concurrent `storage.delete()` races (#164)
+- Publish lock race conditions: Maven lock guard was inside if-block (P0), Cargo lock key was per-version instead of per-crate (P1), Docker pull counter lacked lock (P2) (#160)
+- Raw registry enforces immutability — overwrites return 409 Conflict instead of silently replacing files (#162)
+- Retention `dry_run=true` validation warning added (symmetric with GC) (#162)
+- Flaky test: `validate()` read env var directly, parallel tests broke each other (#160)
+- `llms.txt` mirror CLI examples corrected: `--image` → `--images`, `--package` → `--packages`, pip/cargo/maven use `--lockfile` (#161)
+
+### Changed
+- OpenAPI spec expanded: npm publish, Cargo publish, PyPI upload, Cargo sparse index, Docker manifest delete endpoints documented (#161, #163)
+- README env var table expanded from 10 to 24 variables with full descriptions (#163)
+- README mirror subcommand examples added for all 6 formats (#163)
+- Maven auth column corrected from "proxy-only" to full auth support (#163)
+- Coherence CI pipeline added: version sync, env var coverage, registry list, dead code budget, license check (#156)
+- Negative integration tests added for auth and validation (#156)
+- Config validation warns on Docker proxy credentials in env var (#157)
+- Config validation warns on relative paths with explicit config (#154)
+- Maven env var overrides added, S3 default port fixed to 9000 (#153)
+- Docker pull counter added with publish lock (#160)
+- `lock-audit.sh` script and Makefile targets added (#160)
+- 633 total tests (up from 588)
+
+## [0.6.2] - 2026-04-17
+
+### Fixed
+- Upgrade Alpine 3.20 → 3.21, patching 18 CVEs (5 HIGH: OpenSSL, musl, zlib-ng)
+
+### Changed
+- ArtifactHub logo added to Helm chart metadata
+
+## [0.6.1] - 2026-04-17
+
+### Added
+- Helm chart support — `helm repo add nora https://getnora-io.github.io/helm-charts`
+
+### Changed
+- README updated for v0.6.0
+
+## [0.6.0] - 2026-04-17
+
+### Added
+- **Maven registry** — immutable releases with publish mutex, checksum generation (MD5, SHA-1, SHA-256, SHA-512), `maven-metadata.xml` auto-generation
+- **Retention policies** — `keep_last`, `older_than_days`, `exclude` patterns per registry; `retention-plan` (dry-run) and `retention-apply --yes` (safe-by-default)
+- **Background retention scheduler** — `retention.enabled = true` with configurable interval, single-flight lock prevents overlapping runs
+- **Retention Prometheus metrics** — `nora_retention_versions_deleted_total`, `nora_retention_bytes_freed_total`, `nora_retention_duration_seconds`, `nora_retention_last_run_timestamp`
+- **GC expanded to all registries** — Go incomplete version detection (missing `.info` or `.zip`), Cargo index/crate cross-check, Maven/npm/PyPI checksum orphans, Docker blob orphans
+- **GC/Retention visibility** — reports uncovered registries with file counts after each run
+- **Go retention collector** — `keep_last` for Go modules, parsing `module/@v/version.{info,mod,zip}`
+- **Audit log** — one entry per retention run with keys/bytes/duration
+- 588 total tests (up from 577)
+
+### Changed
+- GC now requires `--apply` flag to delete (dry-run by default)
+- Retention requires `--yes` to apply (plan-only by default)
+- Binary size reduced from 60MB to 21MB (stripped debug symbols in release profile)
+- `RetentionConfig` expanded with `enabled`, `interval` fields and env var overrides (`NORA_RETENTION_ENABLED`, `NORA_RETENTION_INTERVAL`)
+
+### Fixed
+- `md-5` crate aligned to `0.11` (compatible with `digest 0.11`), replacing `md5 0.7` which lacked `Digest` trait
+- Clippy warnings cleaned up across all modules
+- `dead_code` warning on `ArtifactMeta` suppressed
+- Token sorting uses `sort_by_key` for stability
+
+## [0.5.0] - 2026-04-07
+
+### Added
+- **Cargo sparse index (RFC 2789)** — cargo can now use NORA as a proper registry with `sparse+http://` protocol, including `config.json`, prefix-based index lookup, and `cargo publish` wire format support
+- **Cargo publish** — full publish flow with wire format parsing, version immutability (409 Conflict), SHA-256 checksums in sparse index, and proper `warnings` response format
+- **PyPI twine upload** — `twine upload` via multipart/form-data with SHA-256 verification, filename validation, and version immutability
+- **PEP 691 JSON API** — content negotiation via `Accept: application/vnd.pypi.simple.v1+json` for package index and version listing, with hash digests in responses
+- 577 total tests (up from 504), including 25 new Cargo tests and 18 new PyPI tests
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- Cargo dependency field mapping: `version_req` correctly renamed to `req` and `explicit_name_in_toml` to `package` in sparse index entries, matching Cargo registry specification
+- Cargo crate names normalized to lowercase across all endpoints (publish, download, metadata, sparse index) for consistent storage keys
+- Cargo publish write ordering: index written before .crate tarball to prevent orphaned files on partial failure
+- Cargo conflict errors now return Cargo-compatible JSON format (`{"errors": [{"detail": "..."}]}`)
+- PyPI hash fragments preserved when rewriting upstream links (PEP 503 compliance)
+- Redundant path traversal checks removed from crate name validation (charset already excludes unsafe characters)
+
+### Changed
+- Cargo sparse index and config.json responses include `Cache-Control: public, max-age=300`
+- Cargo .crate downloads include `Cache-Control: public, max-age=31536000, immutable` and `Content-Type: application/x-tar`
+- axum upgraded with `multipart` feature for PyPI upload support
+
+
+## [0.4.0] - 2026-04-05
+
+### Added
+- **Docker image mirroring** — nora mirror docker fetches manifests and blobs from upstream registries (Docker Hub, ghcr.io, etc.) and pushes into NORA (#41)
+- **yarn.lock support** — nora mirror yarn parses v1 format with scoped packages and dedup (#44)
+- **--json output for mirror** — nora mirror npm --json outputs structured JSON for CI/CD pipelines (#43)
+- **Storage size in /health** — total_size_bytes field in health endpoint response (#42)
+- 499 total tests (up from 466), 61.5% code coverage (up from 43%)
+
+### Changed
+- fetch_blob_from_upstream and fetch_manifest_from_upstream are now pub for reuse in mirror module
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- tarpaulin exclude-files paths corrected to workspace-relative (coverage jumped from 29% to 61%) (#92)
+- Env var naming unified across all registries (#39, #90)
+
+## [0.3.1] - 2026-04-05
+
+### Added
+- **Token verification cache** — in-memory with 5min TTL, eliminates repeated Argon2id on every request
+- **Property-based tests** (proptest) for Docker/OCI manifest parsers (#84)
+- 466 total tests, 43% code coverage (up from 22%) (#87)
+- MSRV declared in Cargo.toml (#84)
+
+### Changed
+- Upload sessions moved from global static to AppState
+- Blocking I/O replaced with async in hot paths
+- Production docker-compose includes Caddy reverse proxy
+- clippy.toml added for consistent lint rules
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- Proxy request deduplication — concurrent requests coalesced (#83)
+- Multi-registry GC now handles all 7 registry types (#83)
+- TOCTOU race condition in credential validation (#83)
+- Config validation at startup — fail fast with clear errors (#73)
+- Raw registry in dashboard sidebar, footer stats updated (#64)
+- tarpaulin.toml config format (#88)
+
+### Security
+- sha2 0.10→0.11, hmac 0.12→0.13 (#75)
+- Credential hygiene — cleared from memory after use (#83)
+- cosign-installer 3.8.0→4.1.1 (#71)
+
+### Documentation
+- Development Setup in CONTRIBUTING.md (#76)
+- Roadmap consolidated into README (#65, #66)
+- Helm OCI docs and logging env vars documented
+
+## [0.3.0] - 2026-03-21
+
+### Added
+- **Go module proxy** — full GOPROXY protocol support (list, info, mod, zip, latest) (#59)
+- **Upstream proxy retry** with configurable timeout and backoff (#56)
+- **Maven proxy-only mode** — proxy Maven artifacts without local storage (#56)
+- **Anonymous read mode** docs — Go proxy section in README (#62)
+- Integration tests: Docker push/pull, npm install, upstream timeout (#57)
+- Go proxy and Raw registry integration tests in smoke suite (#72)
+- Config validation at startup — clear errors instead of runtime panics
+- Dockerfile HEALTHCHECK for standalone deployments (#72)
+- rust-toolchain.toml for reproducible builds (#72)
+
+### Changed
+- **Token hashing migrated from SHA-256 to Argon2id** — existing tokens auto-migrate on first use (#55)
+- UI: Raw registry in sidebar, footer stats updated (32MB, 7 registries) (#64)
+- README restructured: roadmap in README, removed stale ROADMAP.md (#65, #66)
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- Remove all unwrap() from production code — proper error handling throughout (#72)
+- Add `#![forbid(unsafe_code)]` — no unsafe code allowed at crate level (#72)
+- Add input validation to Cargo registry endpoints (#72)
+- Improve expect() messages with descriptive context (#72)
+- Remove 7 unnecessary clone() calls (#72)
+- Restore .gitleaks.toml lost during merge (#58)
+- Update SECURITY.md — add 0.3.x to supported versions (#72)
+
+### Security
+- Update rustls-webpki 0.103.9 → 0.103.10 (RUSTSEC-2026-0049)
+- Argon2id token hashing replaces SHA-256 (#55)
+- `#![forbid(unsafe_code)]` enforced (#72)
+- Zero unwrap() in production code (#72)
+
+## [0.2.35] - 2026-03-20
+
+### Added
+- **Anonymous read mode** (`NORA_AUTH_ANONYMOUS_READ=true`): allow pull/download without credentials while requiring auth for push. Use case: public demo registries, read-only mirrors.
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- Pin slsa-github-generator and codeql-action by SHA instead of tag
+- Replace anonymous tuple with named struct in activity grouping (readability)
+- Replace unwrap() with if-let pattern in activity grouping (safety)
+- Add warning message on SLSA attestation failure instead of silent suppression
+
+## [0.2.34] - 2026-03-20
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- **UI**: Group consecutive identical activity entries — repeated cache hits show as "artifact (x4)" instead of 4 identical rows
+- **UI**: Fix table cell padding in Mount Points and Activity tables — th/td alignment now consistent
+- **Security**: Update tar crate 0.4.44 → 0.4.45 (CVE-2026-33055 PAX size header bypass, CVE-2026-33056 symlink chmod traversal)
+
+### Added
+- 82 new unit tests across 7 modules (activity_log, audit, config, dashboard_metrics, error, metrics, repo_index)
+- Test coverage badge in README (12.55% → 21.56%)
+- Dashboard GIF (EN/RU crossfade) in README
+- 7 missing environment variables added to docs (NORA_PUBLIC_URL, S3 credentials, NPM_METADATA_TTL, Raw config)
+
+### Changed
+- README restructured: tagline + docker run + GIF first, badges moved to Security section
+- Remove hardcoded OpenSSF Scorecard version from README
+
+
+## [0.2.33] - 2026-03-19
+
+### Security
+- Verify blob digest (SHA256) on upload — reject mismatches with DIGEST_INVALID error
+- Reject sha512 digests (only sha256 supported for blob uploads)
+- Add upload session limits: max 100 concurrent, 2GB per session, 30min TTL (configurable via NORA_MAX_UPLOAD_SESSIONS, NORA_MAX_UPLOAD_SESSION_SIZE_MB)
+- Bind upload sessions to repository name (prevent session fixation attacks)
+- Add security headers: Content-Security-Policy, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
+- Run containers as non-root user (USER nora) in all Dockerfiles
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- Filter .meta.json from Docker tag list (fixes ArgoCD Image Updater tag recursion)
+- Fix catalog endpoint to show namespaced images correctly (library/alpine instead of library)
+
+### Added
+- CodeQL workflow for SAST analysis
+- SLSA provenance attestation for release artifacts
+
+### Changed
+- Configurable upload session size for ML models via NORA_MAX_UPLOAD_SESSION_SIZE_MB (default 2048 MB)
+
+## [0.2.32] - 2026-03-18
+
+### Fixed / Исправлено
+- **Docker dashboard**: Namespaced images (library/alpine, grafana/grafana) now visible in UI — index builder finds manifests by position, not fixed index
+- **Docker proxy**: Auto-prepend `library/` for single-segment official Hub images (nginx, alpine, node) — no need to explicitly use library/ prefix
+- **CI**: Fixed cargo-deny license checks (NCSA for libfuzzer-sys, MIT for fuzz crate, unused-allowed-license config)
+- **Docker dashboard**: Namespaced-образы (library/alpine, grafana/grafana) теперь отображаются в UI
+- **Docker proxy**: Автоподстановка `library/` для официальных образов Docker Hub (nginx, alpine, node) — больше не нужно указывать library/ вручную
+- **CI**: Исправлены проверки лицензий cargo-deny
+
+
+## [0.2.31] - 2026-03-16
+
+### Added / Добавлено
+- **npm URL rewriting**: Tarball URLs in proxied metadata now rewritten to point to NORA (previously tarballs bypassed NORA and downloaded directly from npmjs.org)
+- **npm scoped packages**: Full support for `@scope/package` in proxy handler and repository index
+- **npm publish**: `PUT /npm/{package}` accepts standard npm publish payload with base64-encoded tarballs
+- **npm metadata TTL**: Configurable cache TTL (`NORA_NPM_METADATA_TTL`, default 300s) with stale-while-revalidate fallback
+- **Immutable cache**: SHA256 integrity verification on cached npm tarballs — detects tampering on cache hit
+- **npm URL rewriting**: Tarball URL в проксированных метаданных теперь переписываются на NORA (ранее тарболы шли напрямую из npmjs.org)
+- **npm scoped packages**: Полная поддержка `@scope/package` в прокси-хендлере и индексе репозитория
+- **npm publish**: `PUT /npm/{package}` принимает стандартный npm publish payload с base64-тарболами
+- **npm metadata TTL**: Настраиваемый TTL кеша (`NORA_NPM_METADATA_TTL`, default 300s) с stale-while-revalidate
+- **Immutable cache**: SHA256 проверка целостности npm-тарболов — обнаружение подмены при отдаче из кеша
+
+### Security / Безопасность
+- **Path traversal protection**: Attachment filename validation in npm publish (rejects `../`, `/`, `\`)
+- **Package name mismatch**: npm publish rejects payloads where URL path doesn't match `name` field (anti-spoofing)
+- **Version immutability**: npm publish returns 409 Conflict on duplicate version
+- **Защита от path traversal**: Валидация имён файлов в npm publish (отклоняет `../`, `/`, `\`)
+- **Проверка имени пакета**: npm publish отклоняет payload если имя в URL не совпадает с полем `name` (anti-spoofing)
+- **Иммутабельность версий**: npm publish возвращает 409 Conflict при попытке перезаписать версию
+
+### Fixed / Исправлено
+- **npm proxy_auth**: `proxy_auth` field was configured but not wired into `fetch_from_proxy` — now sends Basic Auth header to upstream
+- **npm proxy_auth**: Поле `proxy_auth` было в конфиге, но не передавалось в `fetch_from_proxy` — теперь отправляет Basic Auth в upstream
+
+
+---
+
+## [0.2.30] - 2026-03-16
+
+### Fixed / Исправлено
+- **Dashboard**: Docker upstream now shown in mount points table (was null)
+- **Dashboard**: Docker namespaced repositories (library/alpine, grafana/grafana) now visible in UI
+- **Dashboard**: npm proxy-cached packages now appear in package list
+- **Dashboard**: Отображение Docker upstream в таблице точек монтирования (было null)
+- **Dashboard**: Namespaced Docker-репозитории (library/alpine, grafana/grafana) теперь видны в UI
+- **Dashboard**: npm-пакеты из прокси-кеша теперь отображаются в списке пакетов
+
+## [0.2.29] - 2026-03-15
+
+### Added / Добавлено
+- **Upstream Authentication**: All registry proxies now support Basic Auth credentials for private upstream registries
+- **Аутентификация upstream**: Все прокси реестров теперь поддерживают Basic Auth для приватных upstream-реестров
+  - Docker: `NORA_DOCKER_UPSTREAMS="https://registry.corp.com|user:pass"`
+  - Maven: `NORA_MAVEN_PROXIES="https://nexus.corp.com/maven2|user:pass"`
+  - npm: `NORA_NPM_PROXY_AUTH="user:pass"`
+  - PyPI: `NORA_PYPI_PROXY_AUTH="user:pass"`
+- **Plaintext credential warning**: NORA logs a warning at startup if credentials are stored in config.toml instead of env vars
+- **Предупреждение о plaintext credentials**: NORA логирует предупреждение при старте, если credentials хранятся в config.toml вместо переменных окружения
+
+### Changed / Изменено
+- Extracted `basic_auth_header()` helper for consistent auth across all protocols
+- Вынесен хелпер `basic_auth_header()` для единообразной авторизации всех протоколов
+
+### Removed / Удалено
+- Removed unused `DockerAuth::fetch_with_auth()` method (dead code cleanup)
+- Удалён неиспользуемый метод `DockerAuth::fetch_with_auth()` (очистка мёртвого кода)
+## [0.2.28] - 2026-03-13
+
+### Fixed / Исправлено
+- **docker-compose.yml**: Fixed image reference from `getnora/nora:latest` to `ghcr.io/getnora-io/nora:latest`
+- **docker-compose.yml**: Исправлена ссылка на образ с `getnora/nora:latest` на `ghcr.io/getnora-io/nora:latest`
+
+### Documentation / Документация
+- **Authentication Guide**: Added complete auth setup guide in README — htpasswd, API tokens, RBAC roles, curl examples
+- **Руководство по аутентификации**: Добавлено полное руководство по настройке auth в README — htpasswd, API-токены, RBAC-роли, примеры curl
+- **FSTEC builds**: Documented `Dockerfile.astra` and `Dockerfile.redos` purpose in README
+- **Сборки ФСТЭК**: Документировано назначение `Dockerfile.astra` и `Dockerfile.redos` в README
+- **TLS / HTTPS**: Added reverse proxy setup guide (Caddy, Nginx) and `insecure-registries` Docker config for internal deployments
+- **TLS / HTTPS**: Добавлено руководство по настройке reverse proxy (Caddy, Nginx) и конфигурация `insecure-registries` Docker для внутренних инсталляций
+
+### Removed / Удалено
+- Removed stale `CHANGELOG.md.bak` from repository
+- Удалён устаревший `CHANGELOG.md.bak` из репозитория
+## [0.2.27] - 2026-03-03
+
+### Added / Добавлено
+- **Configurable body limit**: `NORA_BODY_LIMIT_MB` env var (default: `2048` = 2GB) — replaces hardcoded 100MB limit that caused `413 Payload Too Large` on large Docker image push
+- **Настраиваемый лимит тела запроса**: переменная `NORA_BODY_LIMIT_MB` (по умолчанию: `2048` = 2GB) — заменяет захардкоженный лимит 100MB, вызывавший `413 Payload Too Large` при push больших Docker-образов
+- **Docker Delete API**: `DELETE /v2/{name}/manifests/{reference}` and `DELETE /v2/{name}/blobs/{digest}` per Docker Registry V2 spec (returns 202 Accepted)
+- **Docker Delete API**: `DELETE /v2/{name}/manifests/{reference}` и `DELETE /v2/{name}/blobs/{digest}` по спецификации Docker Registry V2 (возвращает 202 Accepted)
+- Namespace-qualified DELETE variants (`/v2/{ns}/{name}/...`)
+- Audit log integration for delete operations
+
+### Fixed / Исправлено
+- Docker push of images >100MB no longer fails with 413 error
+- Push Docker-образов >100MB больше не падает с ошибкой 413
+## [0.2.26] - 2026-03-03
+
+### Added / Добавлено
+- **Helm OCI support**: `helm push` / `helm pull` now works out of the box via OCI protocol
+- **Поддержка Helm OCI**: `helm push` / `helm pull` теперь работают из коробки через OCI протокол
+- **RBAC**: Token-based role system with three roles — `read`, `write`, `admin` (default: `read`)
+- **RBAC**: Ролевая система на основе токенов — `read`, `write`, `admin` (по умолчанию: `read`)
+- **Audit log**: Persistent append-only JSONL audit trail for all registry operations (`{storage}/audit.jsonl`)
+- **Аудит**: Персистентный append-only JSONL лог всех операций реестра (`{storage}/audit.jsonl`)
+- **GC command**: `nora gc --dry-run` — garbage collection for orphaned blobs (mark-and-sweep)
+- **Команда GC**: `nora gc --dry-run` — сборка мусора для осиротевших блобов (mark-and-sweep)
+
+### Fixed / Исправлено
+- **Helm OCI pull**: Fixed OCI manifest media type detection — manifests with non-Docker `config.mediaType` now correctly return `application/vnd.oci.image.manifest.v1+json`
+- **Helm OCI pull**: Исправлено определение media type OCI манифестов — манифесты с не-Docker `config.mediaType` теперь корректно возвращают `application/vnd.oci.image.manifest.v1+json`
+- **Docker-Content-Digest**: Added missing header in blob upload response (required by Helm OCI client)
+- **Docker-Content-Digest**: Добавлен отсутствующий заголовок в ответе на загрузку blob (требуется клиентом Helm OCI)
+
+### Security / Безопасность
+- Read-only tokens (`role: read`) are now blocked from PUT/POST/DELETE/PATCH operations with HTTP 403
+- Токены только для чтения (`role: read`) теперь блокируются при PUT/POST/DELETE/PATCH с HTTP 403
+## [0.2.25] - 2026-03-03
+
+### Fixed / Исправлено
+- **Rate limiter fix**: Added `NORA_RATE_LIMIT_ENABLED` env var (default: `true`) to disable rate limiting on internal deployments
+- **Исправление rate limiter**: Добавлена переменная `NORA_RATE_LIMIT_ENABLED` (по умолчанию: `true`) для отключения rate limiting на внутренних инсталляциях
+- **SmartIpKeyExtractor**: Upload and general routes now use `SmartIpKeyExtractor` (reads `X-Forwarded-For`) instead of `PeerIpKeyExtractor` — fixes 429 errors behind reverse proxy / Docker bridge
+- **SmartIpKeyExtractor**: Маршруты upload и general теперь используют `SmartIpKeyExtractor` (читает `X-Forwarded-For`) вместо `PeerIpKeyExtractor` — устраняет ошибки 429 за reverse proxy / Docker bridge
+
+### Dependencies / Зависимости
+- `clap` 4.5.56 → 4.5.60
+- `uuid` 1.20.0 → 1.21.0
+- `tempfile` 3.24.0 → 3.26.0
+- `bcrypt` 0.17.1 → 0.18.0
+- `indicatif` 0.17.11 → 0.18.4
+
+### CI/CD
+- `actions/checkout` 4 → 6
+- `actions/upload-artifact` 4 → 7
+- `softprops/action-gh-release` 1 → 2
+- `aquasecurity/trivy-action` 0.30.0 → 0.34.2
+- `docker/build-push-action` 5 → 6
+- Move scan/release to self-hosted runner with NORA cache
+- Сканирование/релиз перенесены на self-hosted runner с кэшем через NORA
+## [0.2.24] - 2026-02-24
+
+### Added / Добавлено
+- `install.sh` installer script live at <https://getnora.io/install.sh> — `curl -fsSL https://getnora.io/install.sh | sh`
+- Скрипт установки `install.sh` доступен на <https://getnora.io/install.sh>
+
+### CI/CD
+- Restore Astra Linux SE Docker image build, Trivy scan, and release artifact (`-astra` tag)
+- Восстановлена сборка Docker-образа для Astra Linux SE, сканирование Trivy и артефакт релиза (тег `-astra`)
+## [0.2.23] - 2026-02-24
+
+### Added / Добавлено
+- Binary (`nora`) + SHA-256 checksum attached to every GitHub Release
+- Бинарник (`nora`) и SHA-256 контрольная сумма прикреплены к каждому релизу GitHub
+
+### Fixed / Исправлено
+- Security: bump `prometheus` 0.13 → 0.14 (CVE-2025-53605) and `bytes` 1.11.0 → 1.11.1 (CVE-2026-25541)
+- Безопасность: обновлены `prometheus` 0.13 → 0.14 (CVE-2025-53605) и `bytes` 1.11.0 → 1.11.1 (CVE-2026-25541)
+
+### CI/CD
+- Add Dependabot for automated dependency updates / Добавлен Dependabot для автоматического обновления зависимостей
+- Pin `aquasecurity/trivy-action` to `0.30.0`, bump to `0.34.1`; scan gate blocks release on HIGH/CRITICAL CVE
+- Закреплён `trivy-action@0.30.0`, обновлён до `0.34.1`; сканирование блокирует релиз при HIGH/CRITICAL CVE
+- Upgrade `codeql-action` v3 → v4 / Обновлён `codeql-action` v3 → v4
+- Fix `deny.toml` deprecated keys (`copyleft`, `unlicensed` removed in `cargo-deny`) / Исправлены устаревшие ключи в `deny.toml`
+- Fix binary path in Docker image (`/usr/local/bin/nora`) / Исправлен путь бинарника в Docker-образе
+- Pin build job to `nora` runner label / Джоб сборки закреплён за runner'ом с меткой `nora`
+- Allow `CDLA-Permissive-2.0` license (`webpki-roots`) / Разрешена лицензия `CDLA-Permissive-2.0`
+- Ignore `RUSTSEC-2025-0119` (unmaintained transitive dep `number_prefix` via `indicatif`)
+
+### Dependencies / Зависимости
+- `chrono` 0.4.43 → 0.4.44
+- `quick-xml` 0.31.0 → 0.39.2
+- `toml` 0.8.23 → 1.0.3+spec-1.1.0
+- `flate2` 1.1.8 → 1.1.9
+- `softprops/action-gh-release` 1 → 2
+- `actions/checkout` 4 → 6
+- `docker/build-push-action` 5 → 6
+
+### Documentation / Документация
+- Replace text title with SVG logo; `O` styled in blue-600 / Заголовок заменён SVG-логотипом; буква `O` стилизована в blue-600
+## [0.2.22] - 2026-02-24
+
+### Changed / Изменено
+- First stable release with Docker images published to container registry
+- Первый стабильный релиз с Docker-образами, опубликованными в container registry
+## [0.2.21] - 2026-02-24
+
+### CI/CD
+- Consolidate all Docker builds into a single job to fix runner network issues / Все Docker-сборки объединены в один job для устранения сетевых проблем runner'а
+- Build musl static binary for maximum portability / Сборка musl-бинарника для максимальной переносимости
+- Add security scanning (Trivy) + SBOM generation to release pipeline / Добавлено сканирование безопасности (Trivy) и генерация SBOM в pipeline релиза
+- Add Cargo cache to speed up builds / Добавлен кэш Cargo для ускорения сборок
+- Replace `gitleaks` GitHub Action with CLI (no license requirement) / `gitleaks` Action заменён CLI-вызовом (лицензия не требуется)
+- Use GitHub-runner's own Rust toolchain (avoid path conflicts) / Используется Rust toolchain самого GitHub-runner'а
+- Use shared runner filesystem instead of artifact API (avoids network upload latency) / Общая файловая система runner'а вместо artifact API
+- Remove Astra Linux build temporarily / Сборка для Astra Linux временно удалена
+## [0.2.20] - 2026-02-23
+
+### Added / Добавлено
+- Parallel CI builds for Astra Linux and RedOS / Параллельная сборка в CI для Astra Linux и RedOS
+
+### Changed / Изменено
+- Use `FROM scratch` base image for Astra Linux and RedOS Docker builds / Базовый образ `FROM scratch` для Docker-сборок Astra Linux и RedOS
+- Shared `reqwest::Client` across all registry handlers / Общий `reqwest::Client` для всех registry-обработчиков
+
+### Fixed / Исправлено
+- Auth: replace `starts_with` with explicit `matches!` for token path checks / Аутентификация: `starts_with` заменён явной проверкой `matches!` для путей с токенами
+- Remove unnecessary QEMU step for amd64-only builds / Удалён лишний шаг QEMU для amd64-сборок
+## [0.2.19] - 2026-01-31
+
+### Added / Добавлено
+- Pre-commit hook to prevent accidental commits of sensitive files / Pre-commit хук для защиты от случайного коммита чувствительных файлов
+- README badges: build status, version, license / Бейджи в README: статус сборки, версия, лицензия
+
+### Performance / Производительность
+- In-memory repository index with pagination for faster dashboard load / Индекс репозитория в памяти с пагинацией для ускорения загрузки дашборда
+
+### Fixed / Исправлено
+- Use `div_ceil` instead of manual ceiling division / Использован `div_ceil` вместо ручной реализации деления с округлением вверх
+## [0.2.18] - 2026-01-31
+
+### Changed
+- Logo styling refinements
+## [0.2.17] - 2026-01-31
+
+### Added
+- Copyright headers to all source files (Volkov Pavel | DevITWay)
+- SPDX-License-Identifier: MIT in all .rs files
+## [0.2.16] - 2026-01-31
+
+### Changed
+- N○RA branding: stylized O logo across dashboard
+- Fixed O letter alignment in logo
+## [0.2.15] - 2026-01-31
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- Code formatting (cargo fmt)
+## [0.2.14] - 2026-01-31
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- Docker dashboard now shows actual image size from manifest layers (config + layers sum)
+- Previously showed only manifest file size (~500 B instead of actual image size)
+## [0.2.13] - 2026-01-31
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- npm dashboard now shows correct version count and package sizes
+- Parses metadata.json for versions, dist.unpackedSize, and time.modified
+- Previously showed 0 versions / 0 B for all packages
+## [0.2.12] - 2026-01-30
+
+### Added
+
+#### Configurable Rate Limiting
+- Rate limits now configurable via `config.toml` and environment variables
+- New config section `[rate_limit]` with parameters: `auth_rps`, `auth_burst`, `upload_rps`, `upload_burst`, `general_rps`, `general_burst`
+- Environment variables: `NORA_RATE_LIMIT_{AUTH|UPLOAD|GENERAL}_{RPS|BURST}`
+
+#### Secrets Provider Architecture
+- Trait-based secrets management (`SecretsProvider` trait)
+- ENV provider as default (12-Factor App pattern)
+- Protected secrets with `zeroize` (memory zeroed on drop)
+- Redacted Debug impl prevents secret leakage in logs
+- New config section `[secrets]` with `provider` and `clear_env` options
+
+#### Docker Image Metadata
+- Support for image metadata retrieval
+
+#### Documentation
+- Bilingual onboarding guide (EN/RU)
+## [0.2.11] - 2026-01-26
+
+### Added
+- Internationalization (i18n) support
+- PyPI registry proxy
+- UI improvements
+## [0.2.10] - 2026-01-26
+
+### Changed
+- Dark theme applied to all UI pages
+## [0.2.9] - 2026-01-26
+
+### Changed
+- Version bump release
+## [0.2.8] - 2026-01-26
+
+### Added
+- Dashboard endpoint added to OpenAPI documentation
+## [0.2.7] - 2026-01-26
+
+### Added
+- Dynamic version display in UI sidebar
+## [0.2.6] - 2026-01-26
+
+### Added
+
+#### Dashboard Metrics
+- Global stats panel: downloads, uploads, artifacts, cache hit rate, storage
+- Extended registry cards with artifact count, size, counters
+- Activity log (last 20 events)
+
+#### UI
+- Dark theme (bg: #0f172a, cards: #1e293b)
+## [0.2.5] - 2026-01-26
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- Docker push/pull: added PATCH endpoint for chunked uploads
+## [0.2.4] - 2026-01-26
+
+### Fixed
+- Go and Raw registries missing from Prometheus metrics (`detect_registry` labeled both as "other") (PR #97, @TickTockBent)
+- Go and Raw registries missing from `/health` endpoint `registries` object (PR #97, @TickTockBent)
+- Garbage collection scoped to Docker-only blobs — prevents GC from deleting non-Docker registry data (PR #109, @TickTockBent)
+- Correct `zeroize` annotation placement and avoid secret cloning in `protected.rs` (PR #108, @TickTockBent)
+- Rate limiting: health/metrics endpoints now exempt
+- Increased upload rate limits for Docker parallel requests
+## [0.2.0] - 2026-01-25
+
+### Added
+
+#### UI: SVG Brand Icons
+- Replaced emoji icons with proper SVG brand icons (Simple Icons style)
+- Docker, Maven, npm, Cargo, PyPI icons now render as scalable vector graphics
+- Consistent icon styling across dashboard, sidebar, and detail pages
+
+#### Testing Infrastructure
+- Unit tests for LocalStorage (8 tests): put/get, list, stat, health_check
+- Unit tests for S3Storage with wiremock HTTP mocking (11 tests)
+- Integration tests for auth/htpasswd (7 tests)
+- Token lifecycle tests (11 tests)
+- Validation tests (21 tests)
+- **Total: 75 tests passing**
+
+#### Security: Input Validation (`validation.rs`)
+- Path traversal protection: rejects `../`, `..\\`, null bytes, absolute paths
+- Docker image name validation per OCI distribution spec
+- Content digest validation (`sha256:[64 hex]`, `sha512:[128 hex]`)
+- Docker tag/reference validation
+- Storage key length limits (max 1024 chars)
+
+#### Security: Rate Limiting (`rate_limit.rs`)
+- Auth endpoints: 1 req/sec, burst 5 (brute-force protection)
+- Upload endpoints: 10 req/sec, burst 20
+- General endpoints: 100 req/sec, burst 200
+- Uses `tower_governor` 0.8 with `PeerIpKeyExtractor`
+
+#### Observability: Request ID Tracking (`request_id.rs`)
+- `X-Request-ID` header added to all responses
+- Accepts upstream request ID or generates UUID v4
+- Tracing spans include request_id for log correlation
+
+#### CLI: Migrate Command (`migrate.rs`)
+- `nora migrate --from local --to s3` - migrate between storage backends
+- `--dry-run` flag for preview without copying
+- Progress bar with indicatif
+- Skips existing files in destination
+- Summary statistics (migrated, skipped, failed, bytes)
+
+#### Error Handling (`error.rs`)
+- `AppError` enum with `IntoResponse` for Axum
+- Automatic conversion from `StorageError` and `ValidationError`
+- JSON error responses with request_id support
+
+### Changed
+- `StorageError` now uses `thiserror` derive macro
+- `TokenError` now uses `thiserror` derive macro
+- Storage wrapper validates keys before delegating to backend
+- Docker registry handlers validate name, digest, reference inputs
+- Body size limit set to 100MB default via `DefaultBodyLimit`
+
+### Dependencies Added
+- `thiserror = "2"` - typed error handling
+- `tower_governor = "0.8"` - rate limiting
+- `governor = "0.10"` - rate limiting backend
+- `tempfile = "3"` (dev) - temporary directories for tests
+- `wiremock = "0.6"` (dev) - HTTP mocking for S3 tests
+
+### Files Added
+- `src/validation.rs` - input validation module
+- `src/migrate.rs` - storage migration module
+- `src/error.rs` - application error types
+- `src/request_id.rs` - request ID middleware
+- `src/rate_limit.rs` - rate limiting configuration
+## [0.1.0] - 2026-01-24
+
+### Added
+- Multi-protocol support: Docker Registry v2, Maven, npm, Cargo, PyPI
+- Web UI dashboard
+- Swagger UI (`/api-docs`)
+- Storage backends: Local filesystem, S3-compatible
+- Smart proxy/cache for Maven and npm
+- Health checks (`/health`, `/ready`)
+- Basic authentication (htpasswd with bcrypt)
+- API tokens (revocable, per-user)
+- Prometheus metrics (`/metrics`)
+- JSON structured logging
+- Environment variable configuration
+- Graceful shutdown (SIGTERM/SIGINT)
+- Backup/restore commands

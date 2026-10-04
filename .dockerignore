@@ -1,0 +1,25 @@
+target/
+.git/
+.gitignore
+*.md
+!README.md
+Dockerfile*
+docker-compose*
+.env*
+*.htpasswd
+.internal*
+
+# Non-build directories
+fuzz/
+coverage/
+data/
+deploy/
+# but keep the baked container config the image stages COPY (#719)
+!deploy/config.docker.toml
+dist/
+docs-ru/
+docs-site/
+examples/
+research/
+scripts/
+tests/

@@ -1,0 +1,94 @@
+[package]
+name = "nora-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Cloud-Native Artifact Registry - Fast, lightweight, multi-protocol"
+keywords = ["registry", "docker", "artifacts", "cloud-native", "devops"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
+
+[lib]
+name = "nora_registry"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nora"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+sha1 = "0.11"
+md-5 = "0.11"
+async-trait.workspace = true
+hex.workspace = true
+object_store = { version = "0.13", features = ["aws", "gcp"] }
+futures = "0.3"
+toml = "1.1"
+uuid = { version = "1", features = ["v4"] }
+bcrypt = "0.19"
+base64 = "0.22"
+prometheus = "0.14"
+utoipa = { version = "5", features = ["axum_extras", "chrono"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
+clap = { version = "4", features = ["derive"] }
+tar = "0.4"
+flate2 = "1.1"
+indicatif = "0.18"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tower_governor = "0.8"
+governor = "0.10"
+parking_lot = "0.12"
+zeroize = { version = "1.8", features = ["derive"] }
+argon2 = { version = "0.5", features = ["std", "rand"] }
+tower-http = { version = "0.6", features = ["set-header"] }
+percent-encoding = "2"
+subtle = "2"
+tokio-util = "0.7"
+arc-swap = "1"
+memchr = "2"
+quick-xml = "0.41"
+# Dual-stack TCP bind: clear IPV6_V6ONLY so a `::` listener also accepts IPv4 (#574).
+socket2 = "0.6"
+rpm = { version = "0.25", default-features = false }
+ar = "0.9"
+lzma-rs = "0.3"
+ruzstd = "0.8"
+pgp = { version = "0.20", default-features = false }
+rand = "0.8"
+
+[dev-dependencies]
+# Tests build real .rpm fixtures; payload+gzip stay out of the release binary.
+rpm = { version = "0.25", default-features = false, features = ["payload", "gzip-compression"] }
+proptest = "1"
+tempfile = "3"
+wiremock = "0.6"
+criterion = { version = "0.8", features = ["html_reports"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+insta = { version = "1", features = ["json"] }
+
+[[bench]]
+name = "parsing"
+harness = false
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["md-5"]
+
+[features]
+demo = []
