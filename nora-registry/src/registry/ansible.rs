@@ -87,12 +87,25 @@ pub fn routes() -> Router<AppState> {
             "/ansible/api/v3/plugin/ansible/content/published/collections/artifacts/{filename}",
             get(download_tarball),
         )
+
+        // Legacy Galaxy roles — v1 API (proxy + immutable tarball cache), so
+        // `ansible-galaxy role install ns.name -s <nora>` works against a
+        // server that only advertised v3.
+        .route("/ansible/v1/roles/", get(v1_roles_search))
+        .route(
+            "/ansible/v1/roles/{role_id}/versions/",
+            get(v1_role_versions),
+        )
+        .route(
+            "/ansible/v1/roles/{role_id}/versions/{version}/download/",
+            get(v1_role_download),
+        )
 }
 
 // ── API discovery ─────────────────────────────────────────────────────
 
 async fn api_discovery() -> Response {
-    let body = r#"{"available_versions":{"v3":"v3/"}}"#;
+    let body = r#"{"available_versions":{"v3":"v3/","v1":"v1/"}}"#;
     (
         StatusCode::OK,
         [(
@@ -102,6 +115,370 @@ async fn api_discovery() -> Response {
         body,
     )
         .into_response()
+}
+
+
+// ── v1 role API (legacy Galaxy roles) ────────────────────────────────────
+//
+// Legacy roles predate the collection (v3) API. ansible-galaxy's role
+// installer (core 2.14/2.15, `role install ns.name`) needs:
+//   discovery → {"available_versions":{"v1":"v1/"}}
+//   GET {server}/v1/roles/?owner__username=…&name=…   (role search)
+//   GET {server}/v1/roles/{id}/versions/              (version list)
+// and, when a version carries `download_url`, downloads the tarball from it.
+// Nora proxies the upstream Galaxy v1 API, rewrites every version's
+// download_url to point back at Nora (so clients never touch GitHub), and
+// caches role metadata (TTL-gated like collection metadata) plus role
+// tarballs (immutable, keyed by role id + version).
+
+async fn v1_roles_search(
+    State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let upstream = upstream_url(&state);
+    let url = append_query(
+        &format!("{}/api/v1/roles/", upstream.trim_end_matches('/')),
+        raw_query.as_deref(),
+    );
+    let cache_key = format!(
+        "ansible/metadata/roles/search/{}",
+        sanitize_key_segment(raw_query.as_deref().unwrap_or("all"))
+    );
+    proxy_json(&state, &url, "ansible-role-search", &cache_key, None).await
+}
+
+async fn v1_role_versions(
+    State(state): State<AppState>,
+    Path(role_id): Path<String>,
+) -> Response {
+    if !is_valid_role_id(&role_id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let base_url = nora_base_url(&state);
+    let versions = match fetch_v1_role_versions(&state, &role_id).await {
+        Some(v) => v,
+        None => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let results = rewrite_v1_download_urls(versions, &base_url, &role_id);
+    let body = serde_json::json!({
+        "count": results.len(),
+        "results": results,
+        "next": null,
+        "next_link": null,
+        "previous": null,
+        "previous_link": null,
+    });
+    state.metrics.record_download("ansible");
+    with_json(body.to_string().into_bytes())
+}
+
+/// Fetch the raw upstream version list for a role, following pagination and
+/// caching the (un-rewritten) body under the metadata cache key with the
+/// collection-metadata TTL. The download path uses these entries' upstream
+/// `download_url` (GitHub tarball) to back the immutable role cache.
+async fn fetch_v1_role_versions(
+    state: &AppState,
+    role_id: &str,
+) -> Option<Vec<serde_json::Value>> {
+    let cache_key = format!("ansible/metadata/roles/versions/{role_id}.json");
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut from_cache = false;
+
+    // TTL-fresh cache hit: seed from the cached body. Note this may be an
+    // *empty* list cached before the branch-entry synthesis existed — an
+    // empty result is still run through synthesis below, so a stale empty
+    // cache can never make the client bypass Nora again.
+    if let Ok(data) = state.storage.get(&cache_key).await {
+        if let Some(meta) = state.storage.stat(&cache_key).await {
+            if crate::cache_ttl::is_within_ttl(meta.modified, state.config.ansible.metadata_ttl) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data) {
+                    if let Some(arr) = v.get("results").and_then(|r| r.as_array()) {
+                        results = arr.clone();
+                        from_cache = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !from_cache {
+        let upstream = upstream_url(state);
+        let page_size = 50usize;
+        loop {
+            let url = format!(
+                "{}/api/v1/roles/{}/versions/?page_size={}&offset={}",
+                upstream.trim_end_matches('/'),
+                role_id,
+                page_size,
+                results.len()
+            );
+            let body = match proxy_fetch(
+                &state.http_client,
+                &url,
+                Duration::from_secs(state.config.ansible.proxy_timeout),
+                expose_opt(&state.config.ansible.proxy_auth),
+                &state.circuit_breaker,
+                RegistryType::Ansible,
+            )
+            .await
+            {
+                Ok(b) => b,
+                // Upstream says the role has no versions at all — that is not
+                // an error for branch-only roles; fall through to synthesis.
+                Err(ProxyError::NotFound) => break,
+                Err(_) => return None,
+            };
+            let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) else {
+                return None;
+            };
+            let page_results = json
+                .get("results")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let total = json
+                .get("count")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(page_results.len() as u64);
+            let before = results.len();
+            results.extend(page_results);
+            if results.is_empty() || results.len() as u64 >= total || results.len() == before {
+                break;
+            }
+        }
+    }
+
+    // No tagged releases: ansible-galaxy falls back to the default branch
+    // (role.github_branch, else "master") and only honours our download_url if
+    // a version entry whose `name` equals that branch exists. Without a
+    // synthesized entry the client would bypass Nora entirely and fetch
+    // https://github.com/{user}/{repo}/archive/{branch}.tar.gz itself, so the
+    // first install would never populate the immutable role cache and an
+    // offline reinstall would fail. Synthesize the branch entry (with the
+    // upstream GitHub tarball URL) so the download path goes through Nora.
+    let mut synthesized = false;
+    if results.is_empty() {
+        if let Some(role) = fetch_v1_role(state, role_id).await {
+            if let Some(entry) = synthesize_branch_entry(&role) {
+                results.push(entry);
+                synthesized = true;
+            }
+        }
+    }
+
+    // Persist when we fetched fresh OR synthesized, so a synthesized branch
+    // entry survives the TTL window (an offline reinstall can then resolve the
+    // version list purely from cache and pull the tarball from the immutable
+    // role cache).
+    if !from_cache || synthesized {
+        let cached_body = serde_json::json!({ "count": results.len(), "results": results })
+            .to_string();
+        let _ = state.storage.put(&cache_key, cached_body.as_bytes()).await;
+    }
+    Some(results)
+}
+
+/// Build the synthetic branch entry for a role that has no tagged releases:
+/// the client's version fallback is `github_branch` (else "master"), and it
+/// will only use our download_url when a version entry matches that name.
+fn synthesize_branch_entry(role: &serde_json::Value) -> Option<serde_json::Value> {
+    let user = role.get("github_user")?.as_str()?;
+    let repo = role.get("github_repo")?.as_str()?;
+    let branch = role
+        .get("github_branch")
+        .and_then(|v| v.as_str())
+        .filter(|b| is_valid_version(b))
+        .unwrap_or("master");
+    Some(serde_json::json!({
+        "name": branch,
+        "download_url": format!(
+            "https://github.com/{}/{}/archive/{}.tar.gz",
+            user, repo, branch
+        ),
+    }))
+}
+
+/// Fetch (and TTL-cache) the upstream v1 role object for a role id.
+async fn fetch_v1_role(state: &AppState, role_id: &str) -> Option<serde_json::Value> {
+    let cache_key = format!("ansible/metadata/roles/role-{role_id}.json");
+    if let Ok(data) = state.storage.get(&cache_key).await {
+        if let Some(meta) = state.storage.stat(&cache_key).await {
+            if crate::cache_ttl::is_within_ttl(meta.modified, state.config.ansible.metadata_ttl) {
+                return serde_json::from_slice::<serde_json::Value>(&data).ok();
+            }
+        }
+    }
+    let upstream = upstream_url(state);
+    let url = format!(
+        "{}/api/v1/roles/{}",
+        upstream.trim_end_matches('/'),
+        role_id
+    );
+    match proxy_fetch(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.ansible.proxy_timeout),
+        expose_opt(&state.config.ansible.proxy_auth),
+        &state.circuit_breaker,
+        RegistryType::Ansible,
+    )
+    .await
+    {
+        Ok(bytes) => {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                let _ = state.storage.put(&cache_key, &bytes).await;
+                return Some(v);
+            }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+async fn v1_role_download(
+    State(state): State<AppState>,
+    Path((role_id, version)): Path<(String, String)>,
+) -> Response {
+    if !is_valid_role_id(&role_id) || !is_valid_version(&version) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    // Store under ansible/roles/{owner}.{name}/{version}.tar.gz so the role
+    // tarball is picked up by the ansible index builder (.tar.gz suffix under
+    // the ansible/ prefix): the dashboard artifact count and size then include
+    // cached roles, and the registry list shows one row per role.
+    let owner_name = match fetch_v1_role(&state, &role_id).await {
+        Some(role) => match (
+            role.get("github_user").and_then(|v| v.as_str()),
+            role.get("name").and_then(|v| v.as_str()),
+        ) {
+            (Some(user), Some(name)) if is_safe_owner(user) && is_valid_name(name) => {
+                format!("{}.{}", user, name)
+            }
+            _ => role_id.clone(),
+        },
+        None => role_id.clone(),
+    };
+    let storage_key = format!("ansible/roles/{owner_name}/{version}.tar.gz");
+    // Immutable cache hit.
+    if let Ok(data) = state.storage.get(&storage_key).await {
+        tracing::info!(role_id, version, "v1 role tarball served from cache");
+        state.metrics.record_download("ansible");
+        state.metrics.record_cache_hit("ansible");
+        return tarball_response(data);
+    }
+    // Compatibility: pre-split caches stored `ansible/roles-cache/{id}/{ver}.role`.
+    // Serve and migrate them so existing installations keep their cache.
+    let legacy_key = format!("ansible/roles-cache/{role_id}/{version}.role");
+    if let Ok(data) = state.storage.get(&legacy_key).await {
+        tracing::info!(role_id, version, "v1 role tarball served from legacy cache location");
+        let _ = state.storage.put(&storage_key, &data).await;
+        state.metrics.record_download("ansible");
+        state.metrics.record_cache_hit("ansible");
+        return tarball_response(data);
+    }
+    // Miss: resolve the upstream (GitHub) tarball URL from version metadata.
+    let versions = match fetch_v1_role_versions(&state, &role_id).await {
+        Some(v) => v,
+        None => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let Some(download_url) = versions.iter().find_map(|v| {
+        if v.get("name").and_then(|n| n.as_str()) == Some(version.as_str()) {
+            v.get("download_url").and_then(|d| d.as_str()).map(str::to_string)
+        } else {
+            None
+        }
+    }) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    tracing::info!(role_id, version, url = %download_url, "v1 role tarball cache miss, fetching upstream");
+    let bytes = match proxy_fetch(
+        &state.http_client,
+        &download_url,
+        Duration::from_secs(state.config.ansible.proxy_timeout),
+        expose_opt(&state.config.ansible.proxy_auth),
+        &state.circuit_breaker,
+        RegistryType::Ansible,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(role_id, version, url = %download_url, error = ?e, "v1 role tarball upstream fetch failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    // Immutable cache: keyed by role id + version, never invalidated.
+    let _ = state.storage.put(&storage_key, &bytes).await;
+    state.metrics.record_download("ansible");
+    tarball_response(Bytes::from(bytes))
+}
+
+fn tarball_response(data: Bytes) -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/gzip"),
+        )],
+        data,
+    )
+        .into_response()
+}
+
+/// Point every version's `download_url` at this Nora so the ansible-galaxy
+/// role installer fetches the tarball from the cache/backend instead of
+/// GitHub. Entries whose `name` fails the version shape check are left as-is
+/// (the client sorts by `name` and would never select them anyway).
+fn rewrite_v1_download_urls(
+    versions: Vec<serde_json::Value>,
+    base_url: &str,
+    role_id: &str,
+) -> Vec<serde_json::Value> {
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(versions.len());
+    for mut v in versions {
+        if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+            if is_valid_version(name) {
+                v["download_url"] = serde_json::Value::String(format!(
+                    "{}/ansible/v1/roles/{}/versions/{}/download/",
+                    base_url, role_id, name
+                ));
+            }
+        }
+        results.push(v);
+    }
+    results
+}
+
+/// Galaxy/GitHub usernames may contain '-', '_' and '.' in addition to
+/// alphanumerics (e.g. `klaiproalternance-ship-it`); the collection-focused
+/// `is_valid_name` rejects '-'. This is only used to build a storage key, so
+/// the rule is: any single path segment that is not `..`, with no separators.
+fn is_safe_owner(user: &str) -> bool {
+    !user.is_empty()
+        && user.len() <= 256
+        && !user.contains('/')
+        && !user.contains('\\')
+        && !user.contains('\0')
+        && !user.contains("..")
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn is_valid_role_id(role_id: &str) -> bool {
+    !role_id.is_empty() && role_id.len() <= 32 && role_id.chars().all(|c| c.is_ascii_digit())
+}
+
+fn sanitize_key_segment(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "=_-&".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 // ── Collection list ────────────────────────────────────────────────────
@@ -1156,6 +1533,109 @@ mod tests {
         assert!(result.contains("http://nora:4000/ansible/download/my-collection-1.0.0.tar.gz"));
         assert!(!result.contains("hub.example.com"));
     }
+    #[test]
+    fn v1_role_id_and_key_validation() {
+        assert!(is_valid_role_id("10962"));
+        assert!(is_valid_role_id("1"));
+        assert!(!is_valid_role_id(""));
+        assert!(!is_valid_role_id("abc"));
+        assert!(!is_valid_role_id("10/1"));
+        assert!(!is_valid_role_id(&"9".repeat(33)));
+
+        assert_eq!(
+            sanitize_key_segment("owner__username=geerlingguy&name=nginx"),
+            "owner__username=geerlingguy&name=nginx"
+        );
+        // Anything unsafe collapses to '_' — the key stays a single path segment.
+        assert_eq!(sanitize_key_segment("a b/c..d"), "a_b_c__d");
+        assert_eq!(sanitize_key_segment(""), "");
+    }
+
+    #[test]
+    fn v1_rewrite_points_download_url_at_nora() {
+        let versions = serde_json::json!([
+            {"id": "u1", "name": "1.0.0", "download_url": "https://github.com/x/y/archive/1.0.0.tar.gz"},
+            {"id": "u2", "name": "2.0", "download_url": "https://github.com/x/y/archive/2.0.tar.gz"},
+            {"id": "u3", "name": "not!a!version", "download_url": "https://github.com/x/y/archive/n.tar.gz"},
+            {"id": "u4", "name": "master", "download_url": "https://github.com/x/y/archive/master.tar.gz"},
+            {"no": "name"}
+        ]);
+        let results = rewrite_v1_download_urls(
+            serde_json::from_value(versions).unwrap(),
+            "http://nora.test",
+            "10962",
+        );
+        assert_eq!(results.len(), 5);
+        assert_eq!(
+            results[0]["download_url"],
+            "http://nora.test/ansible/v1/roles/10962/versions/1.0.0/download/"
+        );
+        assert_eq!(
+            results[1]["download_url"],
+            "http://nora.test/ansible/v1/roles/10962/versions/2.0/download/"
+        );
+        // Invalid version names are left untouched so nothing weird is cached.
+        assert_eq!(
+            results[2]["download_url"],
+            "https://github.com/x/y/archive/n.tar.gz"
+        );
+        // Branch entries (master/main) must be rewritten too — this is what
+        // routes branch-only roles through Nora's immutable cache.
+        assert_eq!(
+            results[3]["download_url"],
+            "http://nora.test/ansible/v1/roles/10962/versions/master/download/"
+        );
+        assert!(results[4].get("download_url").is_none());
+    }
+
+    #[test]
+    fn v1_synthesize_branch_entry() {
+        let role = serde_json::json!({
+            "id": 42868,
+            "github_user": "klaiproalternance-ship-it",
+            "github_repo": "ansible-role-wordpress",
+            "github_branch": "master",
+        });
+        let e = synthesize_branch_entry(&role).unwrap();
+        assert_eq!(e["name"], "master");
+        assert_eq!(
+            e["download_url"],
+            "https://github.com/klaiproalternance-ship-it/ansible-role-wordpress/archive/master.tar.gz"
+        );
+
+        // A non-master default branch is honoured.
+        let main = serde_json::json!({
+            "github_user": "u", "github_repo": "r", "github_branch": "main",
+        });
+        assert_eq!(synthesize_branch_entry(&main).unwrap()["name"], "main");
+
+        // Missing branch falls back to master; missing repo yields None.
+        let no_branch = serde_json::json!({"github_user": "u", "github_repo": "r"});
+        assert_eq!(synthesize_branch_entry(&no_branch).unwrap()["name"], "master");
+        assert!(synthesize_branch_entry(&serde_json::json!({"github_user": "u"})).is_none());
+        assert!(synthesize_branch_entry(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn v1_safe_owner_accepts_galaxy_username_shapes() {
+        for u in ["geerlingguy", "klaiproalternance-ship-it", "seeven770", "a.b_c"] {
+            assert!(is_safe_owner(u), "{u} should be a valid owner");
+        }
+        for u in ["", "..", "a/b", "a\\b", "a b"] {
+            assert!(!is_safe_owner(u), "{u} should be rejected");
+        }
+    }
+
+    #[test]
+    fn v1_role_version_shape_accepts_galaxy_tags() {
+        // Galaxy role version tags: plain semver and two-part tags must pass.
+        for v in ["1.0.0", "2.0", "3.3.1", "v1.2.3", "2024.01", "master", "main"] {
+            assert!(is_valid_version(v), "{v} should be a valid role version");
+        }
+        for v in ["", "a/b", "..", "a\\b", "has space"] {
+            assert!(!is_valid_version(v), "{v} should be rejected");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1614,4 +2094,5 @@ mod integration_tests {
         // Payload is otherwise passed through untouched.
         assert!(text.contains("\"version\":\"4.4.0\""), "data lost: {text}");
     }
+
 }

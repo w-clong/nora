@@ -241,6 +241,7 @@ fn build_context_with(
         audit: crate::config::AuditConfig::default(),
         registries: None,
         signing: crate::config::SigningConfig::default(),
+        watch: crate::config::WatchConfig::default(),
     };
 
     // Apply any custom config tweaks
@@ -325,6 +326,7 @@ fn build_context_with(
         audit: Arc::new(AuditLog::new(&storage_path, crate::audit::AuditMode::Off)),
         docker_auth: Arc::new(docker_auth),
         repo_index: Arc::new(RepoIndex::new()),
+        ui_events: Arc::new(crate::ui::UiEventBus::new()),
         http_client: reqwest::Client::new(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),

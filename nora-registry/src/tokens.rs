@@ -8,6 +8,7 @@ use argon2::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -464,11 +465,18 @@ fn sha256_hex(input: &str) -> String {
 }
 
 /// Set file permissions to 600 (owner read/write only)
+#[cfg(unix)]
 fn set_file_permissions_600(path: &Path) {
-    #[cfg(unix)]
-    {
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+#[cfg(windows)]
+fn set_file_permissions_600(_path: &Path) {
+    // Windows 权限模型不同，此函数在 Windows 上为空操作。
+    // 如需严格限制访问，可后续使用 winapi 设置 ACL。
 }
 
 /// Write a token file atomically: temp file in the same directory, permissions

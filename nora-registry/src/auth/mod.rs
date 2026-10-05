@@ -1743,6 +1743,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             audit: ctx.state.audit.clone(),
             docker_auth: Arc::new(crate::registry::DockerAuth::new(reqwest::Client::new(), 5)),
             repo_index: Arc::new(crate::repo_index::RepoIndex::new()),
+            ui_events: Arc::new(crate::ui::UiEventBus::new()),
             http_client: reqwest::Client::new(),
             upload_sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             publish_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),

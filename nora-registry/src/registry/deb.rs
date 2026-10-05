@@ -83,7 +83,7 @@ fn sidecar_key(repo: &str, path: &str) -> String {
     format!("deb/{repo}/{META_DIR}/{path}.json")
 }
 
-fn release_key(repo: &str) -> String {
+pub(crate) fn release_key(repo: &str) -> String {
     format!("deb/{repo}/Release")
 }
 
@@ -945,14 +945,108 @@ async fn delete_package(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// Outcome of a deb repository reconciliation: how many packages the repo
+/// holds and how many sidecars the run created/removed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReindexSummary {
+    pub packages: usize,
+    pub sidecars_created: usize,
+    pub orphans_removed: usize,
+}
+
+/// Failure modes of [`reindex_repo`]. The HTTP handler maps them onto distinct
+/// statuses (404 / 422 / 500); the out-of-band storage watcher logs them and
+/// moves on.
+#[derive(Debug)]
+pub(crate) enum ReindexError {
+    /// Nothing is stored under `deb/{repo}/` at all.
+    NotFound,
+    /// A present package file failed parsing (not a valid deb).
+    InvalidPackage(String),
+    /// Storage IO / serialization failure.
+    Storage(String),
+}
+
 /// Reconcile a repository with what is actually in storage, then rebuild
-/// (and re-sign) its indexes — the deb counterpart of the rpm reindex; see
-/// that handler for the contract. Runs under the repo publish lock.
+/// (and re-sign) its indexes.
 ///
-/// Packages found without a sidecar are adopted into the *flat* layout: a
-/// structured placement exists only as upload-time intent, so it cannot be
-/// reconstructed from storage. Re-upload with `?distribution=` to place an
-/// adopted package under dists/.
+/// AppState-free core shared by the `/deb/{repo}/-/reindex` handler and the
+/// out-of-band storage watcher, so both go through the same
+/// list-read-generate-write cycle over the whole repo (same TOCTOU
+/// protection: callers must run it under the repo publish lock). Packages
+/// found without a sidecar are adopted into the *flat* layout: a structured
+/// placement exists only as upload-time intent, so it cannot be reconstructed
+/// from storage. Re-upload with `?distribution=` to place an adopted package
+/// under dists/.
+pub(crate) async fn reindex_repo(
+    storage: &crate::Storage,
+    signer: Option<&crate::signing::RepoSigner>,
+    repo: &str,
+) -> Result<ReindexSummary, ReindexError> {
+    let prefix = format!("deb/{repo}/");
+    let keys = storage
+        .list(&prefix)
+        .await
+        .map_err(|e| ReindexError::Storage(format!("list: {e}")))?;
+    if keys.is_empty() {
+        return Err(ReindexError::NotFound);
+    }
+
+    let meta_prefix = format!("deb/{repo}/{META_DIR}/");
+    let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut sidecars: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for key in &keys {
+        if let Some(rest) = key.strip_prefix(&meta_prefix) {
+            if let Some(pkg) = rest.strip_suffix(".json") {
+                sidecars.insert(pkg.to_string());
+            }
+        } else if let Some(rest) = key.strip_prefix(&prefix) {
+            if rest.to_ascii_lowercase().ends_with(".deb") {
+                packages.insert(rest.to_string());
+            }
+        }
+    }
+
+    let mut orphans_removed = 0usize;
+    for stale in sidecars.difference(&packages) {
+        storage
+            .delete(&sidecar_key(repo, stale))
+            .await
+            .map_err(|e| {
+                ReindexError::Storage(format!("delete orphan sidecar {stale}: {e}"))
+            })?;
+        orphans_removed += 1;
+    }
+
+    let mut sidecars_created = 0usize;
+    for missing in packages.difference(&sidecars) {
+        let body = storage
+            .get(&package_key(repo, missing))
+            .await
+            .map_err(|e| ReindexError::Storage(format!("read {missing}: {e}")))?;
+        let record = extract_record(&body, missing, None).map_err(|e| {
+            ReindexError::InvalidPackage(format!("{missing} is not a valid deb: {e}"))
+        })?;
+        let json = serde_json::to_vec(&record)
+            .map_err(|e| ReindexError::Storage(format!("serialize {missing}: {e}")))?;
+        storage
+            .put(&sidecar_key(repo, missing), &json)
+            .await
+            .map_err(|e| ReindexError::Storage(format!("write sidecar {missing}: {e}")))?;
+        sidecars_created += 1;
+    }
+
+    regenerate_indexes(storage, signer, repo)
+        .await
+        .map_err(ReindexError::Storage)?;
+
+    Ok(ReindexSummary {
+        packages: packages.len(),
+        sidecars_created,
+        orphans_removed,
+    })
+}
+
 async fn reindex(
     State(state): State<AppState>,
     Path(repo): Path<String>,
@@ -975,102 +1069,37 @@ async fn reindex(
     let lock = state.publish_lock(&release_key(&repo));
     let _guard = lock.lock().await;
 
-    let prefix = format!("deb/{repo}/");
-    let keys = match state.storage.list(&prefix).await {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::error!(error = %e, repo = %repo, "deb reindex: list failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    match reindex_repo(&state.storage, state.signer.as_deref(), &repo).await {
+        Ok(summary) => {
+            state.audit.log(AuditEntry::new(
+                "reindex",
+                crate::auth::audit_actor(&user),
+                &repo,
+                "deb",
+                "",
+            ));
+            state.repo_index.invalidate("deb");
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "packages": summary.packages,
+                    "sidecars_created": summary.sidecars_created,
+                    "orphans_removed": summary.orphans_removed,
+                    "signed": state.signer.is_some(),
+                })),
+            )
+                .into_response()
         }
-    };
-    if keys.is_empty() {
-        return (StatusCode::NOT_FOUND, "No such repository").into_response();
-    }
-
-    let meta_prefix = format!("deb/{repo}/{META_DIR}/");
-    let mut packages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut sidecars: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for key in &keys {
-        if let Some(rest) = key.strip_prefix(&meta_prefix) {
-            if let Some(pkg) = rest.strip_suffix(".json") {
-                sidecars.insert(pkg.to_string());
-            }
-        } else if let Some(rest) = key.strip_prefix(&prefix) {
-            if rest.to_ascii_lowercase().ends_with(".deb") {
-                packages.insert(rest.to_string());
-            }
+        Err(ReindexError::NotFound) => {
+            (StatusCode::NOT_FOUND, "No such repository").into_response()
         }
-    }
-
-    let mut orphans_removed = 0usize;
-    for stale in sidecars.difference(&packages) {
-        match state.storage.delete(&sidecar_key(&repo, stale)).await {
-            Ok(()) => orphans_removed += 1,
-            Err(e) => {
-                tracing::error!(error = %e, repo = %repo, pkg = %stale, "deb reindex: orphan sidecar delete failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+        Err(ReindexError::InvalidPackage(msg)) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
+        }
+        Err(ReindexError::Storage(msg)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
         }
     }
-
-    let mut sidecars_created = 0usize;
-    for missing in packages.difference(&sidecars) {
-        let body = match state.storage.get(&package_key(&repo, missing)).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(error = %e, repo = %repo, pkg = %missing, "deb reindex: package read failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        let record = match extract_record(&body, missing, None) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(error = %e, repo = %repo, pkg = %missing, "deb reindex: not a valid deb — refusing to index");
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("{missing} is not a valid deb: {e}"),
-                )
-                    .into_response();
-            }
-        };
-        let json = match serde_json::to_vec(&record) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!(error = %e, "deb reindex: sidecar serialize failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        if let Err(e) = state.storage.put(&sidecar_key(&repo, missing), &json).await {
-            tracing::error!(error = %e, repo = %repo, pkg = %missing, "deb reindex: sidecar write failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        sidecars_created += 1;
-    }
-
-    if let Err(e) = regenerate_indexes(&state.storage, state.signer.as_deref(), &repo).await {
-        tracing::error!(repo = %repo, error = %e, "deb reindex: index regeneration failed");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    state.audit.log(AuditEntry::new(
-        "reindex",
-        crate::auth::audit_actor(&user),
-        &repo,
-        "deb",
-        "",
-    ));
-    state.repo_index.invalidate("deb");
-
-    (
-        StatusCode::OK,
-        axum::Json(serde_json::json!({
-            "packages": packages.len(),
-            "sidecars_created": sidecars_created,
-            "orphans_removed": orphans_removed,
-            "signed": state.signer.is_some(),
-        })),
-    )
-        .into_response()
 }
 
 fn content_type(path: &str) -> &'static str {

@@ -45,7 +45,7 @@ pub struct ServerConfig {
 }
 
 pub(super) fn default_server_host() -> String {
-    String::from("127.0.0.1")
+    String::from("0.0.0.0")
 }
 
 pub(super) fn default_server_port() -> u16 {

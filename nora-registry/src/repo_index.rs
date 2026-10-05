@@ -38,6 +38,11 @@ pub struct RegistryIndex {
     data: RwLock<Arc<Vec<RepoInfo>>>,
     dirty: AtomicBool,
     rebuild_lock: AsyncMutex<()>,
+    /// True while a background rebuild is in flight. Guards the "serve stale +
+    /// rebuild in background" path so at most one background rebuild runs per
+    /// registry; a rebuild that finishes while the index is dirty again simply
+    /// leaves `dirty` set and the next read kicks another one.
+    rebuilding: AtomicBool,
 }
 
 impl RegistryIndex {
@@ -46,6 +51,7 @@ impl RegistryIndex {
             data: RwLock::new(Arc::new(Vec::new())),
             dirty: AtomicBool::new(true),
             rebuild_lock: AsyncMutex::new(()),
+            rebuilding: AtomicBool::new(false),
         }
     }
 
@@ -92,7 +98,7 @@ impl Default for RegistryIndex {
 
 /// Main repository index for all registries
 pub struct RepoIndex {
-    indexes: HashMap<RegistryType, RegistryIndex>,
+    indexes: HashMap<RegistryType, Arc<RegistryIndex>>,
     /// Epoch-seconds of the last accepted admin reindex (0 = never). Used to
     /// debounce operator-triggered reindex so a tight `reindex + read` loop
     /// cannot amplify into repeated full-storage scans (see `try_accept_reindex`).
@@ -103,7 +109,7 @@ impl RepoIndex {
     pub fn new() -> Self {
         let mut indexes = HashMap::new();
         for rt in RegistryType::all() {
-            indexes.insert(*rt, RegistryIndex::new());
+            indexes.insert(*rt, Arc::new(RegistryIndex::new()));
         }
         Self {
             indexes,
@@ -145,7 +151,13 @@ impl RepoIndex {
         Ok(())
     }
 
-    /// Get index with double-checked locking (prevents race condition)
+    /// Get index with double-checked locking (prevents race condition).
+    ///
+    /// When the index is dirty but a previous build exists, the *stale* data
+    /// is served immediately and the rebuild runs in the background — a page
+    /// click never blocks on a full registry rescan just because one package
+    /// changed out-of-band. Only the very first build (no stale data at all)
+    /// rebuilds synchronously on the request path.
     pub async fn get(&self, registry: &str, storage: &Storage) -> Arc<Vec<RepoInfo>> {
         let reg_type = match RegistryType::from_str_opt(registry) {
             Some(rt) => rt,
@@ -161,70 +173,34 @@ impl RepoIndex {
             return index.get_cached();
         }
 
-        // Slow path: acquire rebuild lock (only one thread rebuilds)
-        let _guard = index.rebuild_lock.lock().await;
-
-        // Double-check under lock (another thread may have rebuilt)
-        if index.is_dirty() {
-            let data = match reg_type {
-                RegistryType::Docker => build_docker_index(storage).await,
-                RegistryType::Maven => build_maven_index(storage).await,
-                RegistryType::Npm => build_npm_index(storage).await,
-                RegistryType::Cargo => build_cargo_index(storage).await,
-                RegistryType::PyPI => build_pypi_index(storage).await,
-                RegistryType::Go => build_go_index(storage).await,
-                RegistryType::Raw => build_raw_index(storage).await,
-                RegistryType::Nuget => {
-                    let (p, s) = crate::registry::nuget::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Gems => build_gems_index(storage).await,
-                RegistryType::Terraform => {
-                    let (p, s) = crate::registry::terraform::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Ansible => {
-                    let (p, s) = crate::registry::ansible::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::PubDart => {
-                    let (p, s) = crate::registry::pub_dart::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Conan => build_conan_index(storage).await,
-                RegistryType::Rpm => {
-                    let (p, s) = crate::registry::rpm::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Deb => {
-                    let (p, s) = crate::registry::deb::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-                RegistryType::Cpan => {
-                    let (p, s) = crate::registry::cpan::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
-                }
-            };
-            match data {
-                Some(data) => {
-                    info!(registry = registry, count = data.len(), "Index rebuilt");
-                    index.set(data);
-                }
-                None => {
-                    // Storage list failed mid-rebuild. Leave the index dirty so the
-                    // next read retries instead of caching an empty result as fresh:
-                    // otherwise a transient storage error during a restore/resync
-                    // would make the UI report zero artifacts on healthy data.
-                    tracing::warn!(
-                        registry = registry,
-                        "index rebuild skipped: storage list failed; serving stale index"
-                    );
-                }
+        // Dirty but a previous build exists: serve stale now, rebuild in the
+        // background. The double-compare-and-swap guarantees at most one
+        // background rebuild per registry at a time; concurrent readers all
+        // get the same stale snapshot, and a rebuild finishing against a
+        // re-dirtied index leaves `dirty` set for the next read to redo.
+        let stale = index.get_cached();
+        if !stale.is_empty() {
+            if index
+                .rebuilding
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Acquire)
+                .is_ok()
+            {
+                let index = Arc::clone(index);
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    rebuild_registry_index(&index, reg_type, &storage).await;
+                    index.rebuilding.store(false, Ordering::Release);
+                });
             }
+            return stale;
         }
 
+        // No stale data: first-ever build, rebuild synchronously.
+        rebuild_registry_index(index, reg_type, storage).await;
         index.get_cached()
     }
+
+
 
     /// Get counts for stats (no rebuild, just current state)
     pub fn counts(&self) -> HashMap<RegistryType, usize> {
@@ -250,6 +226,74 @@ impl Default for RepoIndex {
 }
 
 // ============================================================================
+/// Rebuild one registry index under its per-registry rebuild lock
+/// (double-checked: skip if another task already rebuilt it).
+async fn rebuild_registry_index(
+    index: &RegistryIndex,
+    reg_type: RegistryType,
+    storage: &Storage,
+) {
+    let _guard = index.rebuild_lock.lock().await;
+    if !index.is_dirty() {
+        return;
+    }
+    let data = match reg_type {
+        RegistryType::Docker => build_docker_index(storage).await,
+        RegistryType::Maven => build_maven_index(storage).await,
+        RegistryType::Npm => build_npm_index(storage).await,
+        RegistryType::Cargo => build_cargo_index(storage).await,
+        RegistryType::PyPI => build_pypi_index(storage).await,
+        RegistryType::Go => build_go_index(storage).await,
+        RegistryType::Raw => build_raw_index(storage).await,
+        RegistryType::Nuget => {
+            let (p, s) = crate::registry::nuget::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        RegistryType::Gems => build_gems_index(storage).await,
+        RegistryType::Terraform => {
+            let (p, s) = crate::registry::terraform::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        RegistryType::Ansible => {
+            let (p, s) = crate::registry::ansible::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        RegistryType::PubDart => {
+            let (p, s) = crate::registry::pub_dart::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        RegistryType::Conan => build_conan_index(storage).await,
+        RegistryType::Rpm => {
+            let (p, s) = crate::registry::rpm::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        RegistryType::Deb => {
+            let (p, s) = crate::registry::deb::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+        RegistryType::Cpan => {
+            let (p, s) = crate::registry::cpan::INDEX_PATTERN;
+            build_generic_index(storage, p, s).await
+        }
+    };
+    match data {
+        Some(data) => {
+            info!(registry = reg_type.as_str(), count = data.len(), "Index rebuilt");
+            index.set(data);
+        }
+        None => {
+            // Storage list failed mid-rebuild. Leave the index dirty so the
+            // next read retries instead of caching an empty result as fresh:
+            // otherwise a transient storage error during a restore/resync
+            // would make the UI report zero artifacts on healthy data.
+            tracing::warn!(
+                registry = reg_type.as_str(),
+                "index rebuild skipped: storage list failed; serving stale index"
+            );
+        }
+    }
+}
+
 // Index builders
 // ============================================================================
 

@@ -36,11 +36,22 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
 /// the "Ok implies durable" contract (L3 durability). Fails closed: a parent that
 /// cannot be fsync'd means durability is not guaranteed, so we return Err.
 async fn sync_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        let dir = fs::File::open(parent).await?;
-        dir.sync_all().await?;
+    // Windows：File::open 打开目录需要 FILE_FLAG_BACKUP_SEMANTICS，
+    // 且 FlushFileBuffers 对目录句柄不可靠，NTFS 的目录条目耐久性由
+    // 文件系统日志保证——直接跳过，避免 put 误报 Access Denied。
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        if let Some(parent) = path.parent() {
+            let dir = fs::File::open(parent).await?;
+            dir.sync_all().await?;
+        }
+        Ok(())
+    }
 }
 
 /// Local filesystem storage backend (zero-config default). Hash pins live in an
@@ -110,6 +121,11 @@ impl LocalStorage {
     }
 
     fn key_to_path(&self, key: &str) -> PathBuf {
+        // Windows 文件名禁止 ':'（NTFS 数据流分隔符），Docker digest "sha256:<hex>"
+        // 直接进 key 导致缓存写入失败（os error 123/87/5）。仅在 Windows 转义，
+        // 读写都经过此函数，天然一致；%3A 与 object.rs 中 @→%40 的编码风格一致。
+        #[cfg(windows)]
+        let key = key.replace(':', "%3A");
         self.base_path.join(key)
     }
 
@@ -121,6 +137,8 @@ impl LocalStorage {
                 if path.is_file() {
                     if let Ok(rel_path) = path.strip_prefix(base) {
                         let key = rel_path.to_string_lossy().replace('\\', "/");
+                        #[cfg(windows)]
+                        let key = key.replace("%3A", ":");
                         if key != PIN_FILE
                             && !super::is_reserved_signing_key(&key)
                             && (key.starts_with(prefix) || prefix.is_empty())
@@ -145,6 +163,28 @@ impl LocalStorage {
         prefix: &str,
         results: &mut Vec<(String, FileMeta)>,
     ) {
+        // Prune subtrees that cannot contain `prefix`. Before the prefix
+        // filter existed this walked the *entire* storage tree for every
+        // registry index rebuild, so a single reindex after an out-of-band
+        // change (or the first dashboard hit) serialised full-tree walks for
+        // all nine registries on the request path — the page-stall users saw.
+        // With pruning, a rebuild only descends into the registry's own
+        // subtree (e.g. `deb/`), which is what actually holds its files.
+        if !prefix.is_empty() {
+            if let Ok(rel) = dir.strip_prefix(base) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                let rel_str = rel_str.trim_end_matches('/');
+                if !rel_str.is_empty() {
+                    let p = prefix.trim_end_matches('/');
+                    let in_prefix_subtree = rel_str == p
+                        || rel_str.starts_with(&format!("{p}/"))
+                        || p.starts_with(&format!("{rel_str}/"));
+                    if !in_prefix_subtree {
+                        return;
+                    }
+                }
+            }
+        }
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -154,6 +194,8 @@ impl LocalStorage {
                 if metadata.is_file() {
                     if let Ok(rel_path) = path.strip_prefix(base) {
                         let key = rel_path.to_string_lossy().replace('\\', "/");
+                        #[cfg(windows)]
+                        let key = key.replace("%3A", ":");
                         if key != PIN_FILE
                             && !super::is_reserved_signing_key(&key)
                             && (key.starts_with(prefix) || prefix.is_empty())

@@ -191,6 +191,27 @@ pub async fn api_dashboard(
     Json(build_dashboard_response(&state, authenticated).await)
 }
 
+/// HTML fragment of the dashboard registry-cards grid, re-rendered by the
+/// real-time refresh path (SSE event → `fetch('/api/ui/dashboard/cards')` →
+/// swap). Mirrors the server-side card markup exactly, translations included.
+pub async fn api_dashboard_cards(
+    State(state): State<AppState>,
+    Query(query): Query<LangQuery>,
+    user: Option<Extension<AuthenticatedUser>>,
+) -> axum::response::Html<String> {
+    let lang = super::i18n::Lang::from_str(query.lang.as_deref().unwrap_or_default());
+    let authenticated = user.map(|Extension(u)| u.0 != "anonymous").unwrap_or(false);
+    let data = build_dashboard_response(&state, authenticated).await;
+    axum::response::Html(super::templates::render_registry_cards_grid(&data, lang))
+}
+
+/// Language selection for API-rendered UI fragments (same precedence as the
+/// page-level handlers: query param > cookie, but here query only).
+#[derive(Deserialize, Default)]
+pub struct LangQuery {
+    pub lang: Option<String>,
+}
+
 /// Build the dashboard JSON payload.
 ///
 /// When `authenticated` is false, `proxy_upstreams` is redacted (empty vec)
@@ -947,11 +968,56 @@ pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>
 /// Namespace and name are `[a-z0-9_]+`, so the first `-` is an unambiguous separator.
 /// Does NOT call `storage.stat` — avoids latency on large collection counts.
 pub async fn get_ansible_namespace_listing(storage: &Storage, path: &str) -> Vec<RepoInfo> {
-    let keys = storage.list("ansible/download/").await.unwrap_or_default();
-
-    if keys.is_empty() {
-        return vec![];
+    // Cached v1 Galaxy roles live under ansible/roles/{owner}.{name}/{ver}.tar.gz.
+    // Give them a browse path parallel to the collection namespaces:
+    //   /ui/ansible/roles           → one row per role
+    //   /ui/ansible/roles/{role}    → version tarballs of that role
+    if path == "roles" || path.starts_with("roles/") {
+        let keys = storage.list("ansible/roles/").await.unwrap_or_default();
+        if path == "roles" {
+            let mut per_role: HashMap<String, usize> = HashMap::new();
+            for key in &keys {
+                if let Some(rest) = key.strip_prefix("ansible/roles/") {
+                    if let Some(seg) = rest.split('/').next() {
+                        if !seg.is_empty() {
+                            *per_role.entry(seg.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            let mut result: Vec<RepoInfo> = per_role
+                .into_iter()
+                .map(|(name, versions)| RepoInfo {
+                    name,
+                    versions,
+                    ..Default::default()
+                })
+                .collect();
+            result.sort_by(|a, b| a.name.cmp(&b.name));
+            return result;
+        }
+        let role = path.strip_prefix("roles/").unwrap_or("");
+        let mut result: Vec<RepoInfo> = Vec::new();
+        for key in keys {
+            if let Some(rest) = key.strip_prefix("ansible/roles/") {
+                let mut parts = rest.splitn(2, '/');
+                if parts.next() == Some(role) {
+                    if let Some(file) = parts.next() {
+                        result.push(RepoInfo {
+                            name: file.to_string(),
+                            versions: 1,
+                            is_file: true,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        return result;
     }
+
+    let keys = storage.list("ansible/download/").await.unwrap_or_default();
 
     // Parse filenames: {ns}-{name}-{version}.tar.gz
     // splitn(3, '-') → [ns, name, version_with_ext]
@@ -992,6 +1058,26 @@ pub async fn get_ansible_namespace_listing(storage: &Storage, path: &str) -> Vec
                 ..Default::default()
             })
             .collect();
+        // Append a "roles" entry so cached roles show up in the browse root
+        // even when no collections are mirrored yet.
+        let role_keys = storage.list("ansible/roles/").await.unwrap_or_default();
+        if !role_keys.is_empty() {
+            let mut role_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for key in &role_keys {
+                if let Some(rest) = key.strip_prefix("ansible/roles/") {
+                    if let Some(seg) = rest.split('/').next() {
+                        if !seg.is_empty() {
+                            role_dirs.insert(seg.to_string());
+                        }
+                    }
+                }
+            }
+            result.push(RepoInfo {
+                name: "roles".to_string(),
+                versions: role_dirs.len(),
+                ..Default::default()
+            });
+        }
         result.sort_by(|a, b| a.name.cmp(&b.name));
         result
     } else {

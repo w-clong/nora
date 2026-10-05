@@ -19,6 +19,7 @@ mod retention;
 mod server;
 mod signing_cfg;
 mod storage;
+mod watch;
 
 // Infrastructure configs
 pub use self::audit_cfg::AuditConfig;
@@ -39,6 +40,7 @@ pub use self::registries::{EnableSpec, RegistriesSection};
 pub use self::retention::{RetentionConfig, RetentionRule};
 pub use self::server::{ServerConfig, TlsConfig};
 pub use self::storage::{StorageConfig, StorageMode};
+pub use self::watch::WatchConfig;
 
 // Registry configs (re-exported from registry/ submodule tree)
 pub use self::registry::*;
@@ -199,6 +201,11 @@ pub struct Config {
     pub audit: AuditConfig,
     #[serde(default)]
     pub signing: SigningConfig,
+    /// Out-of-band storage change watch (deb/rpm/raw file drops, rebuilds
+    /// `Packages`/`repodata`, drives real-time UI refresh). See
+    /// [`WatchConfig`].
+    #[serde(default)]
+    pub watch: WatchConfig,
     /// Declarative registry selection: `[registries] enable = ["docker", "npm"]`
     #[serde(default)]
     pub registries: Option<RegistriesSection>,
@@ -1033,7 +1040,11 @@ impl Config {
     }
 
     /// Validate: warnings are logged, errors reject the configuration.
-    fn checked(self) -> Result<Self, ConfigLoadError> {
+    fn checked(mut self) -> Result<Self, ConfigLoadError> {
+        if self.server.public_url.is_none() {
+            self.server.public_url =
+                Some(format!("http://{}:{}", self.server.host, self.server.port));
+        }
         let (warnings, errors) = self.validate();
         for w in &warnings {
             tracing::warn!("Config validation: {}", w);
@@ -1109,6 +1120,7 @@ impl Config {
         self.signing.apply_env_overrides();
         self.gc.apply_env_overrides();
         self.retention.apply_env_overrides();
+        self.watch.apply_env_overrides();
 
         // Secrets — SecretsConfig lives in crate::secrets, no apply_env_overrides method
         if let Ok(val) = env::var("NORA_SECRETS_PROVIDER") {
@@ -1351,7 +1363,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 4000);
         assert_eq!(config.server.body_limit_mb, 2048);
         assert!(config.server.public_url.is_none());

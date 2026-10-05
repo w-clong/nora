@@ -5,6 +5,37 @@ pub(crate) mod api;
 pub mod components;
 pub mod i18n;
 
+/// Broadcast bus for "repository state changed" events, driving the web UI's
+/// real-time refresh. Every handled storage change (out-of-band drops, admin
+/// reindex, ...) bumps a monotonic generation and fans it out to open pages
+/// through `/api/ui/events` (EventSource/SSE). Pages re-render the affected
+/// fragments without a full reload.
+pub struct UiEventBus {
+    tx: tokio::sync::broadcast::Sender<u64>,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl UiEventBus {
+    pub fn new() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        Self {
+            tx,
+            generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Broadcast a repository-change event; returns the new generation.
+    pub fn notify_changed(&self) -> u64 {
+        let generation = self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let _ = self.tx.send(generation);
+        generation
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.tx.subscribe()
+    }
+}
+
 mod static_assets;
 mod templates;
 
@@ -16,10 +47,12 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::Next,
+    response::sse::{Event, KeepAlive, Sse},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Extension, Form, Router,
 };
+use std::convert::Infallible;
 
 use crate::auth::{AuthenticatedRole, AuthenticatedUser};
 use api::*;
@@ -171,6 +204,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/ui/{registry_type}/list", get(api_list))
         .route("/api/ui/{registry_type}/{name}", get(api_detail))
         .route("/api/ui/{registry_type}/search", get(api_search))
+        // Real-time UI refresh stream (SSE): fires `reindex` events when the
+        // server detects out-of-band storage changes / reindexes.
+        .route("/api/ui/events", get(events_stream))
+        .route("/api/ui/dashboard/cards", get(api::api_dashboard_cards))
 }
 
 /// Prefix NORA's root-absolute UI self-links with `base` so the UI works when
@@ -263,6 +300,39 @@ async fn dashboard(
     let authenticated = user.map(|Extension(u)| u.0 != "anonymous").unwrap_or(false);
     let response = build_dashboard_response(&state, authenticated).await;
     Html(render_dashboard(&response, lang, auth_enabled))
+}
+
+/// Server-Sent Events stream for real-time UI refresh.
+///
+/// Subscribes to [`UiEventBus`] and forwards every repository-change event as
+/// `event: reindex` with the generation counter as payload. A `:keep-alive`
+/// comment is emitted every 15s so proxies/NAT keep the connection open; the
+/// browser's EventSource reconnects automatically on drop.
+pub(crate) async fn events_stream(
+    State(state): State<AppState>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    use futures::stream;
+    let rx = state.ui_events.subscribe();
+    let stream = stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(generation) => Some((
+                Ok::<_, Infallible>(Event::default().event("reindex").data(generation.to_string())),
+                rx,
+            )),
+            // Subscriber missed events (lagged behind a burst) — still tell
+            // the page to refresh, it re-reads authoritative state anyway.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((
+                Ok::<_, Infallible>(Event::default().event("reindex").data("refresh")),
+                rx,
+            )),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+        }
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
 // Docker pages
@@ -900,6 +970,18 @@ async fn ansible_browse(
     match segments.len() {
         // /ui/ansible/community → list collections in namespace
         1 => {
+            let entries = api::get_ansible_namespace_listing(&state.storage, &path).await;
+            let total = entries.len();
+            Html(templates::render_ansible_dir(
+                &path,
+                &entries,
+                total,
+                lang,
+                auth_enabled,
+            ))
+        }
+        // /ui/ansible/roles/{role} → version tarballs of one role
+        2 if segments[0] == "roles" => {
             let entries = api::get_ansible_namespace_listing(&state.storage, &path).await;
             let total = entries.len();
             Html(templates::render_ansible_dir(
